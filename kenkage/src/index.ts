@@ -167,14 +167,33 @@ const isNode =
 
 // ── WASM URL resolution ───────────────────────────────────────────
 
+/**
+ * Each branch below uses a literal string path (not a template literal) so
+ * bundlers that statically recognize `new URL('./x', import.meta.url)` as an
+ * asset reference — webpack 5+, Vite/Rollup — can see it, copy the file
+ * alongside the bundle, and rewrite the URL correctly even when this module
+ * is fully inlined into someone else's output. A dynamic `` `./${filename}` ``
+ * isn't statically analyzable, so it would silently fall back to
+ * `import.meta.url` pointing at the *bundle's* location instead of this
+ * package's — which is exactly what breaks under full bundling.
+ * esbuild does NOT support this convention (verified against 0.25 — a
+ * `new URL(..., import.meta.url)` call is left as runtime code regardless of
+ * `--loader:.wasm=file`), so esbuild-bundled consumers (and any other
+ * bundler without this convention) still need to pass `wasmUrl` to
+ * `createKenkage()` explicitly — see the README's "Bundler consumers"
+ * section.
+ */
 function resolveDefaultWasmUrl(engine: 'core' | 'full'): string {
-  const filename = engine === 'full' ? 'kenkage-full.wasm' : 'kenkage-core.wasm';
   if (isNode) {
     // In Node.js, resolve relative to the dist/ directory of this package
-    return new URL(`../dist/${filename}`, import.meta.url).toString();
+    return engine === 'full'
+      ? new URL('../dist/kenkage-full.wasm', import.meta.url).toString()
+      : new URL('../dist/kenkage-core.wasm', import.meta.url).toString();
   }
   // In the browser, the WASM file is co-located with the JS bundle
-  return new URL(`./${filename}`, import.meta.url).toString();
+  return engine === 'full'
+    ? new URL('./kenkage-full.wasm', import.meta.url).toString()
+    : new URL('./kenkage-core.wasm', import.meta.url).toString();
 }
 
 // ── Minimal WASI shim ─────────────────────────────────────────────

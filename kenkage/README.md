@@ -146,6 +146,37 @@ export default async function Page() {
 `createKenkagePage` loads the WASM module once via `fs.readFileSync` and
 reuses the instance across requests.
 
+### Bundler consumers
+
+kenkage locates its own `.wasm` file relative to `import.meta.url`, which
+works out of the box in Node and in a browser loading it as a real ES
+module. **webpack 5+ and Vite/Rollup** natively recognize the
+`new URL('./file.ext', import.meta.url)` pattern as a static asset
+reference — they'll copy the file alongside your bundle and rewrite the URL
+correctly, even when kenkage's code is fully bundled in with yours.
+
+**esbuild's `--bundle` does not** — as of esbuild 0.25, a `new URL(...,
+import.meta.url)` call is left as plain runtime code, not statically
+detected as an asset reference, regardless of `--loader:.wasm=file`. If
+your build uses esbuild (or any other bundler without this convention) to
+fully bundle kenkage's code, `import.meta.url` at runtime resolves to
+*your* bundle's location instead of kenkage's installed one, and loading
+will fail to find the file. Pass `wasmUrl` to override resolution
+explicitly:
+
+```ts
+const engine = await createKenkage({
+  wasmUrl: new URL('./node_modules/kenkage/dist/kenkage-core.wasm', import.meta.url).toString(),
+});
+```
+
+Point it at wherever kenkage's `dist/` actually ends up relative to your
+running code — for esbuild specifically, marking `kenkage` as `--external`
+(so it's `require`/`import`-resolved normally at runtime instead of
+inlined) avoids the problem entirely, if your setup allows it.
+
+Point it at wherever kenkage's `dist/` actually ends up in your build output.
+
 ## `core` vs `full`
 
 | | `core` | `full` |
