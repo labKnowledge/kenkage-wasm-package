@@ -2,15 +2,16 @@
   "name": "kenkage",
   "version": "0.1.0",
   "description": "Sandboxed browser engine (DOM + real QuickJS) compiled to WebAssembly — parse HTML, query the DOM, and run untrusted JavaScript on-device, in the browser, with no server round-trip",
-  "homepage": "https://github.com/takenolab/kenkage#readme",
+  "homepage": "https://github.com/labKnowledge/kenkage-wasm-package/tree/main/kenkage#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/takenolab/kenkage.git"
+    "url": "git+https://github.com/labKnowledge/kenkage-wasm-package.git",
+    "directory": "kenkage"
   },
   "bugs": {
-    "url": "https://github.com/takenolab/kenkage/issues"
+    "url": "https://github.com/labKnowledge/kenkage-wasm-package/issues"
   },
-  "author": "takenolab",
+  "author": "labKnowledge",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",

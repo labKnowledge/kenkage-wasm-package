@@ -1,9 +1,26 @@
 # kenkage
 
-A sandboxed browser engine — real DOM parsing and a real JavaScript engine
-(QuickJS) — compiled to WebAssembly. It runs entirely on-device: in the
-browser tab, in a Node process, or inside an AI agent's own sandbox. No
-headless Chrome, no server round-trip, no host JS `eval()` required.
+**We believe an agent's isolation shouldn't depend on how carefully you
+babysit it — it should be a property of where its code physically runs.**
+
+Right now, giving an AI agent the ability to read and act on a web page
+means picking one of two trades: hand it a full browser process (Chromium
+via Playwright/Puppeteer, or a cloud browser behind an API) and accept the
+weight, the server, and the latency — or hand it a lightweight in-process DOM
+shim (jsdom, happy-dom) and accept that it was never built to contain code
+it didn't write. That second option isn't a small gap: happy-dom's own
+maintainers have documented that untrusted JavaScript can escape its
+sandbox via prototype pollution, even with `eval`/`Function` disabled. A DOM
+implementation that merely *behaves* like a browser doesn't get a browser's
+isolation for free.
+
+kenkage closes that gap instead of picking a side of it. It compiles a real
+DOM engine and a real JavaScript engine (QuickJS) to WebAssembly, so the
+isolation comes from WASM's linear memory model — not from a spawned
+process, not from a shim's best-effort discipline. That means it runs
+**on-device**: inside a browser tab, inside an agent's own Node/Electron
+process, at the edge — anywhere V8 or a WASM runtime already lives, with
+no browser binary to install and no server in the loop.
 
 ```ts
 import { createKenkage } from 'kenkage';
@@ -17,17 +34,21 @@ console.log(page.title, page.text);
 
 ## Why
 
-Letting an AI agent "browse the web" today usually means driving a full
-headless browser (Chromium via Puppeteer/Playwright) or shipping raw HTML to
-an LLM and hoping it's structured enough to reason about. Both are heavy,
-server-bound, and give an agent's untrusted, model-generated JavaScript a
-real browser's full attack surface to run in.
+Most of the field has converged on the same two answers to "how does an
+agent touch the web": scale up Chromium (Playwright, Puppeteer, managed
+cloud browsers), or scale down the DOM (jsdom, happy-dom, linkedom). The
+first treats isolation as something you buy with infrastructure — more
+containers, more browser instances, more orchestration. The second treats
+it as optional, because a DOM shim's job was always "pass the tests," not
+"contain a hostile script."
 
-kenkage is a different shape: a real DOM tree and a real JS engine, compiled
-to WASM, so they run **on-device** — in a browser tab, an Electron/CLI
-agent process, or a Node worker. There is no browser binary to install, no
-server to proxy through, and untrusted code executes inside a memory-isolated
-WASM sandbox instead of the host's JS runtime.
+We think that's backwards for agentic use. An agent parsing a page and
+running the JavaScript it finds there — or JavaScript an LLM generated on
+the fly — is running code from a source it doesn't control. That code
+deserves a hard boundary by construction, not a process boundary you have
+to provision, or a shim's goodwill. Compiling the engine itself to WASM is
+how kenkage gets there: the boundary is the compilation target, so it holds
+wherever the module runs.
 
 ## Features
 

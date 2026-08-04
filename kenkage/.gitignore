@@ -18,3 +18,6 @@ src/zig/core.wasm
 # misc
 .DS_Store
 *.log
+
+# internal marketing/tooling notes, not contributor-facing
+.why-first-knowledge.md
