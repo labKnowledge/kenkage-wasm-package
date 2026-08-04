@@ -219,6 +219,7 @@ extern const char *kk_dom_get_inner_html(uint32_t id);
 extern uint32_t kk_dom_get_inner_html_len(void);
 extern int kk_dom_set_inner_html(uint32_t id, const char *html, uint32_t html_len);
 extern int kk_dom_append_child(uint32_t parent_id, uint32_t child_id);
+extern int kk_dom_insert_before(uint32_t parent_id, uint32_t new_id, uint32_t reference_id);
 extern int kk_dom_remove_child(uint32_t id);
 extern uint32_t kk_dom_parent(uint32_t id);
 extern uint8_t kk_dom_node_type(uint32_t id);
@@ -423,6 +424,18 @@ static JSValue node_appendChild(JSContext *ctx, JSValueConst this_val, int argc,
     return JS_DupValue(ctx, argv[0]);
 }
 
+/* insertBefore(newNode, referenceNode) — referenceNode may be omitted or
+ * null/undefined, matching real DOM semantics ("insert at the end"); id_arg
+ * already maps non-Node values through JS_ToInt32, where null/undefined
+ * both resolve to 0, the same sentinel kk_dom_insert_before treats as
+ * "no reference". */
+static JSValue node_insertBefore(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 1) return JS_UNDEFINED;
+    uint32_t reference_id = argc >= 2 ? id_arg(ctx, argv[1]) : 0;
+    kk_dom_insert_before(node_id_of(this_val), id_arg(ctx, argv[0]), reference_id);
+    return JS_DupValue(ctx, argv[0]);
+}
+
 static JSValue node_removeChild(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     if (argc < 1) return JS_UNDEFINED;
     kk_dom_remove_child(id_arg(ctx, argv[0]));
@@ -499,6 +512,7 @@ static const JSCFunctionListEntry node_proto_funcs[] = {
     JS_CFUNC_DEF("removeAttribute", 1, node_removeAttribute),
     JS_CFUNC_DEF("hasAttribute", 1, node_hasAttribute),
     JS_CFUNC_DEF("appendChild", 1, node_appendChild),
+    JS_CFUNC_DEF("insertBefore", 2, node_insertBefore),
     JS_CFUNC_DEF("removeChild", 1, node_removeChild),
     JS_CFUNC_DEF("remove", 0, node_remove),
     JS_CFUNC_DEF("querySelector", 1, node_querySelector),
@@ -744,6 +758,50 @@ static const char *DOM_PRELUDE =
     "    };\n"
     "  },\n"
     "});\n"
+    /* Real constructors for the globals page scripts most commonly reference
+     * directly (`new Event(...)`) or use for feature-detection/instanceof
+     * checks (`typeof Document !== 'undefined'`, `x instanceof HTMLElement`).
+     * These were previously absent entirely — scripts that touched them hit
+     * a bare ReferenceError. Kept minimal (no bubbling/capturing phases,
+     * since there's no real render tree to propagate through) rather than a
+     * full spec implementation. */
+    "globalThis.EventTarget = class EventTarget {};\n"
+    "globalThis.Node = class Node extends EventTarget {};\n"
+    "globalThis.Element = class Element extends Node {};\n"
+    "globalThis.HTMLElement = class HTMLElement extends Element {};\n"
+    "Object.setPrototypeOf(__LPWNodeProto, HTMLElement.prototype);\n"
+    "globalThis.Document = class Document extends Node {};\n"
+    "Object.setPrototypeOf(document, Document.prototype);\n"
+    /* getElementsByTagName is extremely common in the wild (the classic
+     * Google Analytics async-loader snippet and PostHog's init snippet both
+     * use it — `m=s.getElementsByTagName(o)[0]`) and was simply missing. A
+     * bare tag name is already a valid CSS selector, so this is a direct
+     * alias rather than a new query path — same pragmatic-subset spirit as
+     * URL/URLSearchParams above (a real getElementsByTagName result is a
+     * *live* HTMLCollection; this returns a static array, close enough for
+     * scripts that just index into element [0]). */
+    "document.getElementsByTagName = function (tag) { return this.querySelectorAll(tag); };\n"
+    "__LPWNodeProto.getElementsByTagName = function (tag) { return this.querySelectorAll(tag); };\n"
+    "globalThis.Event = class Event {\n"
+    "  constructor(type, init) {\n"
+    "    this.type = String(type);\n"
+    "    this.bubbles = !!(init && init.bubbles);\n"
+    "    this.cancelable = !!(init && init.cancelable);\n"
+    "    this.defaultPrevented = false;\n"
+    "    this.target = null;\n"
+    "    this.currentTarget = null;\n"
+    "    this.timeStamp = Date.now();\n"
+    "  }\n"
+    "  preventDefault() { if (this.cancelable) this.defaultPrevented = true; }\n"
+    "  stopPropagation() {}\n"
+    "  stopImmediatePropagation() {}\n"
+    "};\n"
+    "globalThis.CustomEvent = class CustomEvent extends Event {\n"
+    "  constructor(type, init) {\n"
+    "    super(type, init);\n"
+    "    this.detail = (init && 'detail' in init) ? init.detail : null;\n"
+    "  }\n"
+    "};\n"
     "__LPWNodeProto.__listeners = null;\n"
     "__LPWNodeProto.addEventListener = function (type, fn) {\n"
     "  (this.__listeners ??= {})[type] ??= [];\n"
@@ -754,9 +812,9 @@ static const char *DOM_PRELUDE =
     "  if (l) { const i = l.indexOf(fn); if (i >= 0) l.splice(i, 1); }\n"
     "};\n"
     "__LPWNodeProto.dispatchEvent = function (evOrType) {\n"
-    "  const type = typeof evOrType === 'string' ? evOrType : evOrType.type;\n"
-    "  const ev = typeof evOrType === 'string' ? { type, target: this, currentTarget: this, preventDefault(){}, stopPropagation(){} } : evOrType;\n"
-    "  const l = this.__listeners && this.__listeners[type];\n"
+    "  const ev = typeof evOrType === 'string' ? new Event(evOrType) : evOrType;\n"
+    "  ev.target = this; ev.currentTarget = this;\n"
+    "  const l = this.__listeners && this.__listeners[ev.type];\n"
     "  if (l) for (const fn of l.slice()) { try { fn.call(this, ev); } catch (e) {} }\n"
     "  return true;\n"
     "};\n"
@@ -764,6 +822,14 @@ static const char *DOM_PRELUDE =
     "document.addEventListener = __LPWNodeProto.addEventListener.bind(document);\n"
     "document.removeEventListener = __LPWNodeProto.removeEventListener.bind(document);\n"
     "document.dispatchEvent = __LPWNodeProto.dispatchEvent.bind(document);\n"
+    /* window (== globalThis) needs its own listener store and bound methods,
+     * same as document — `window.addEventListener('load', ...)` is at least
+     * as common as the document-level form (PostHog's own init snippet uses
+     * exactly this) and was simply missing before. */
+    "globalThis.__listeners = null;\n"
+    "globalThis.addEventListener = __LPWNodeProto.addEventListener.bind(globalThis);\n"
+    "globalThis.removeEventListener = __LPWNodeProto.removeEventListener.bind(globalThis);\n"
+    "globalThis.dispatchEvent = __LPWNodeProto.dispatchEvent.bind(globalThis);\n"
     "globalThis.__kk_timer_queue = [];\n"
     "globalThis.__kk_timer_next_id = 1;\n"
     "globalThis.setTimeout = function (fn, _delay, ...args) {\n"

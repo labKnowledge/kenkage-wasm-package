@@ -846,6 +846,49 @@ export fn kk_dom_append_child(parent_id: u32, child_id: u32) bool {
     return true;
 }
 
+/// Inserts `new_id` as a child of `parent_id`, immediately before `reference_id`.
+/// `reference_id` of 0 (or any id not actually among parent's children) falls
+/// back to appending at the end — same graceful-degradation spirit as the
+/// rest of this DOM: a script's malformed insertBefore call shouldn't crash
+/// the page, it should just do something reasonable. This is the missing
+/// piece behind the extremely common "async script loader" snippet pattern
+/// (`ref.parentNode.insertBefore(newScript, ref)`) used by Google Analytics,
+/// PostHog, and most other tag-manager/analytics snippets in the wild.
+export fn kk_dom_insert_before(parent_id: u32, new_id: u32, reference_id: u32) bool {
+    const parent = docNode(parent_id) orelse return false;
+    const new_node = docNode(new_id) orelse return false;
+
+    if (new_node.parent) |old| {
+        const filtered = arena_buf.alloc(*Node, old.children.len) catch return false;
+        var count: usize = 0;
+        for (old.children) |c| {
+            if (c != new_node) {
+                filtered[count] = c;
+                count += 1;
+            }
+        }
+        old.children = filtered[0..count];
+    }
+
+    var insert_at: usize = parent.children.len; // default: append at the end
+    if (docNode(reference_id)) |ref| {
+        for (parent.children, 0..) |c, i| {
+            if (c == ref) {
+                insert_at = i;
+                break;
+            }
+        }
+    }
+
+    const new_children = arena_buf.alloc(*Node, parent.children.len + 1) catch return false;
+    @memcpy(new_children[0..insert_at], parent.children[0..insert_at]);
+    new_children[insert_at] = new_node;
+    @memcpy(new_children[insert_at + 1 ..], parent.children[insert_at..]);
+    parent.children = new_children;
+    new_node.parent = parent;
+    return true;
+}
+
 /// Removes a node from its parent (a no-op if it has none).
 export fn kk_dom_remove_child(id: u32) bool {
     const n = docNode(id) orelse return false;

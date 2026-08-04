@@ -742,7 +742,13 @@ export async function createKenkage(
 
       // Real pages hang a lot of setup off these — run any handlers scripts
       // registered for them so state that depends on "page is ready" settles.
-      await api.eval("document.dispatchEvent('DOMContentLoaded'); document.dispatchEvent('load');");
+      // `load` is dispatched on both: DOMContentLoaded is document-only per
+      // spec, but `load` listeners are overwhelmingly registered on `window`
+      // in the wild (analytics/tag-manager snippets in particular), so both
+      // targets get it rather than assuming which one a given script used.
+      await api.eval(
+        "document.dispatchEvent('DOMContentLoaded'); document.dispatchEvent('load'); window.dispatchEvent('load');"
+      );
       await drainPendingFetches(doFetch);
 
       return {
