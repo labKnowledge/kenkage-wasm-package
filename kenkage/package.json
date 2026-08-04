@@ -1,0 +1,84 @@
+{
+  "name": "kenkage",
+  "version": "0.1.0",
+  "description": "Sandboxed browser engine (DOM + real QuickJS) compiled to WebAssembly — parse HTML, query the DOM, and run untrusted JavaScript on-device, in the browser, with no server round-trip",
+  "homepage": "https://github.com/takenolab/kenkage#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/takenolab/kenkage.git"
+  },
+  "bugs": {
+    "url": "https://github.com/takenolab/kenkage/issues"
+  },
+  "author": "takenolab",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    },
+    "./react": {
+      "types": "./dist/react.d.ts",
+      "import": "./dist/react.mjs",
+      "require": "./dist/react.js"
+    },
+    "./next": {
+      "types": "./dist/next.d.ts",
+      "import": "./dist/next.mjs",
+      "require": "./dist/next.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --experimental-vm-modules node_modules/.bin/vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "react-dom": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    },
+    "react-dom": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "browser",
+    "wasm",
+    "webassembly",
+    "html-parser",
+    "dom",
+    "headless",
+    "zig",
+    "quickjs",
+    "kenkage",
+    "sandbox",
+    "on-device",
+    "ai-agent",
+    "agentic",
+    "browser-use",
+    "js-sandbox"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "@types/react": "^19.2.18",
+    "esbuild": "^0.28.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}

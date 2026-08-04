@@ -1,0 +1,958 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kenkage Browser Kit — Test App</title>
+<style>
+  /* ── Reset & Base ─────────────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #0e0f13;
+    --bg-raised: #16171d;
+    --bg-surface:#1c1d25;
+    --border:    #2a2b35;
+    --border-focus: #5b6abf;
+    --fg:        #e2e4ed;
+    --fg-muted:  #8b8fa5;
+    --fg-dim:    #555872;
+    --accent:    #7c8aff;
+    --accent-dim:#5b6abf;
+    --green:     #6ee7a0;
+    --orange:    #f5a962;
+    --red:       #f47272;
+    --radius:    10px;
+    --radius-sm: 6px;
+    --mono:      'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', ui-monospace, monospace;
+    --sans:      'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    --transition: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  html { font-size: 15px; }
+
+  body {
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--fg);
+    min-height: 100vh;
+    line-height: 1.6;
+    overflow-x: hidden;
+  }
+
+  /* ── Background decoration ───────────────────────────────── */
+  body::before {
+    content: '';
+    position: fixed;
+    top: -40%; left: -20%;
+    width: 60vw; height: 60vw;
+    background: radial-gradient(circle, rgba(124,138,255,0.06) 0%, transparent 70%);
+    pointer-events: none;
+    z-index: 0;
+  }
+  body::after {
+    content: '';
+    position: fixed;
+    bottom: -30%; right: -15%;
+    width: 50vw; height: 50vw;
+    background: radial-gradient(circle, rgba(110,231,160,0.04) 0%, transparent 70%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* ── Layout ──────────────────────────────────────────────── */
+  .app { position: relative; z-index: 1; max-width: 1400px; margin: 0 auto; padding: 20px 24px 40px; }
+
+  /* ── Header ──────────────────────────────────────────────── */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 0 24px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 24px;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .logo-group { display: flex; align-items: center; gap: 14px; }
+  .logo {
+    width: 40px; height: 40px;
+    background: linear-gradient(135deg, var(--accent), var(--green));
+    border-radius: var(--radius);
+    display: grid; place-items: center;
+    font-weight: 800; font-size: 18px; color: var(--bg);
+    flex-shrink: 0;
+  }
+  .logo-text h1 { font-size: 1.25rem; font-weight: 700; letter-spacing: -0.02em; }
+  .logo-text p { font-size: 0.78rem; color: var(--fg-muted); margin-top: -2px; }
+
+  .status-chips { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 5px 12px;
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: 100px;
+    font-size: 0.75rem;
+    color: var(--fg-muted);
+    font-family: var(--mono);
+    transition: var(--transition);
+  }
+  .chip .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--fg-dim);
+    transition: var(--transition);
+  }
+  .chip.ready .dot { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .chip.error .dot  { background: var(--red);   box-shadow: 0 0 6px var(--red); }
+  .chip.loading .dot { background: var(--orange); animation: pulse 1s ease-in-out infinite; }
+
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+  /* ── Main Grid ───────────────────────────────────────────── */
+  .main-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    align-items: start;
+  }
+  @media (max-width: 900px) {
+    .main-grid { grid-template-columns: 1fr; }
+  }
+
+  /* ── Panels ──────────────────────────────────────────────── */
+  .panel {
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    transition: var(--transition);
+  }
+  .panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-surface);
+    flex-shrink: 0;
+  }
+  .panel-title {
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--fg-muted);
+  }
+  .panel-body { padding: 16px; flex: 1; min-height: 0; }
+
+  /* ── Textarea ─────────────────────────────────────────────── */
+  textarea {
+    width: 100%;
+    min-height: 320px;
+    max-height: 55vh;
+    resize: vertical;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--fg);
+    font-family: var(--mono);
+    font-size: 0.82rem;
+    line-height: 1.7;
+    padding: 14px 16px;
+    outline: none;
+    transition: var(--transition);
+  }
+  textarea:focus { border-color: var(--border-focus); box-shadow: 0 0 0 3px rgba(91,106,191,0.15); }
+  textarea::placeholder { color: var(--fg-dim); }
+
+  /* ── Buttons ─────────────────────────────────────────────── */
+  .btn-row { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 9px 18px;
+    border: none;
+    border-radius: var(--radius-sm);
+    font-family: var(--sans);
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: var(--transition);
+    outline: none;
+  }
+  .btn:focus-visible { box-shadow: 0 0 0 3px rgba(91,106,191,0.3); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-primary {
+    background: var(--accent);
+    color: var(--bg);
+  }
+  .btn-primary:hover:not(:disabled) { background: #929fff; transform: translateY(-1px); box-shadow: 0 4px 14px rgba(124,138,255,0.3); }
+  .btn-ghost {
+    background: transparent;
+    color: var(--fg-muted);
+    border: 1px solid var(--border);
+  }
+  .btn-ghost:hover:not(:disabled) { color: var(--fg); border-color: var(--fg-dim); background: var(--bg-surface); }
+
+  /* ── Tabs ────────────────────────────────────────────────── */
+  .tabs {
+    display: flex;
+    gap: 2px;
+    background: var(--bg);
+    padding: 3px;
+    border-radius: var(--radius-sm);
+  margin-bottom: 14px;
+    flex-shrink: 0;
+  }
+  .tab-btn {
+    flex: 1;
+    padding: 7px 10px;
+    border: none;
+    background: transparent;
+    color: var(--fg-dim);
+    font-family: var(--sans);
+    font-size: 0.76rem;
+    font-weight: 600;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: var(--transition);
+    outline: none;
+    white-space: nowrap;
+  }
+  .tab-btn:hover { color: var(--fg-muted); }
+  .tab-btn.active { background: var(--bg-surface); color: var(--fg); box-shadow: 0 1px 3px rgba(0,0,0,0.2); }
+  .tab-panel { display: none; min-height: 280px; max-height: 55vh; overflow: auto; }
+  .tab-panel.active { display: block; }
+
+  /* ── Code / Pre blocks ────────────────────────────────────── */
+  .code-block {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 14px 16px;
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    line-height: 1.7;
+    color: var(--fg);
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow: auto;
+    max-height: 55vh;
+    tab-size: 2;
+  }
+  .code-block.empty { color: var(--fg-dim); font-style: italic; }
+
+  /* ── Query section ────────────────────────────────────────── */
+  .query-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 14px;
+  }
+  .query-input {
+    flex: 1;
+    padding: 9px 14px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--fg);
+    font-family: var(--mono);
+    font-size: 0.82rem;
+    outline: none;
+    transition: var(--transition);
+  }
+  .query-input:focus { border-color: var(--border-focus); box-shadow: 0 0 0 3px rgba(91,106,191,0.15); }
+  .query-input::placeholder { color: var(--fg-dim); }
+
+  /* ── Node tree ────────────────────────────────────────────── */
+  .node-list { list-style: none; }
+  .node-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: var(--transition);
+    border: 1px solid transparent;
+    font-family: var(--mono);
+    font-size: 0.78rem;
+  }
+  .node-item:hover { background: var(--bg-surface); border-color: var(--border); }
+  .node-item.selected { background: var(--bg-surface); border-color: var(--accent-dim); }
+  .node-id {
+    color: var(--fg-dim);
+    font-size: 0.7rem;
+    min-width: 36px;
+    text-align: right;
+  }
+  .node-tag-name { color: var(--accent); font-weight: 600; }
+  .node-text-preview { color: var(--fg-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px; }
+  .no-results { color: var(--fg-dim); font-style: italic; font-size: 0.82rem; padding: 20px 0; text-align: center; }
+
+  /* ── Node detail card ─────────────────────────────────────── */
+  .node-detail {
+    margin-top: 12px;
+    padding: 14px 16px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-size: 0.8rem;
+    animation: fadeSlideIn 0.2s ease;
+  }
+  .node-detail dt { color: var(--fg-dim); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 10px; }
+  .node-detail dt:first-child { margin-top: 0; }
+  .node-detail dd { color: var(--fg); font-family: var(--mono); font-size: 0.78rem; word-break: break-word; }
+  .attr-table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+  .attr-table th { text-align: left; color: var(--fg-dim); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; padding: 4px 8px 4px 0; }
+  .attr-table td { font-family: var(--mono); font-size: 0.78rem; padding: 3px 8px 3px 0; color: var(--fg); }
+  .attr-name { color: var(--green); }
+
+  /* ── Stats bar ────────────────────────────────────────────── */
+  .stats-bar {
+    display: flex;
+    gap: 20px;
+    padding: 10px 16px;
+    background: var(--bg-surface);
+    border-top: 1px solid var(--border);
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    color: var(--fg-dim);
+    flex-shrink: 0;
+    flex-wrap: wrap;
+  }
+  .stats-bar .stat-val { color: var(--fg-muted); font-weight: 600; }
+
+  /* ── Loading overlay ──────────────────────────────────────── */
+  .overlay {
+    position: fixed; inset: 0;
+    background: rgba(14,15,19,0.85);
+    backdrop-filter: blur(8px);
+    display: grid; place-items: center;
+    z-index: 100;
+    transition: opacity 0.4s ease;
+  }
+  .overlay.hidden { opacity: 0; pointer-events: none; }
+  .overlay-box {
+    text-align: center;
+    animation: fadeSlideIn 0.5s ease;
+  }
+  .spinner {
+    width: 44px; height: 44px;
+    margin: 0 auto 18px;
+    border: 3px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  .overlay-box h2 { font-size: 1.1rem; font-weight: 600; margin-bottom: 6px; }
+  .overlay-box p { font-size: 0.82rem; color: var(--fg-muted); }
+  .overlay-box .err { color: var(--red); }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes fadeSlideIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+  /* ── Engine Stats ───────────────────────────────────────── */
+  .engine-stats {
+    display: flex;
+    gap: 24px;
+    padding: 12px 16px;
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .engine-stats .stat-item {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 0.78rem;
+  }
+  .engine-stats .stat-label { color: var(--fg-dim); font-weight: 500; }
+  .engine-stats .stat-value { color: var(--fg); font-family: var(--mono); font-weight: 600; }
+  .engine-stats .stat-value.version { color: var(--accent); }
+
+  /* ── Small textarea (for eval) ───────────────────────────── */
+  .code-textarea {
+    width: 100%;
+    min-height: 100px;
+    max-height: 200px;
+    resize: vertical;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--fg);
+    font-family: var(--mono);
+    font-size: 0.82rem;
+    line-height: 1.6;
+    padding: 12px 14px;
+    outline: none;
+    transition: var(--transition);
+  }
+  .code-textarea:focus { border-color: var(--border-focus); box-shadow: 0 0 0 3px rgba(91,106,191,0.15); }
+  .code-textarea::placeholder { color: var(--fg-dim); }
+
+  /* ── Select ───────────────────────────────────────────────── */
+  .select-input {
+    padding: 9px 14px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--fg);
+    font-family: var(--mono);
+    font-size: 0.82rem;
+    outline: none;
+    transition: var(--transition);
+    cursor: pointer;
+    appearance: auto;
+  }
+  .select-input:focus { border-color: var(--border-focus); box-shadow: 0 0 0 3px rgba(91,106,191,0.15); }
+
+  /* ── Result indicator ─────────────────────────────────────── */
+  .result-indicator {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px;
+    border-radius: 100px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    font-family: var(--mono);
+    margin-bottom: 10px;
+  }
+  .result-indicator.success { background: rgba(110,231,160,0.1); color: var(--green); border: 1px solid rgba(110,231,160,0.2); }
+  .result-indicator.fail { background: rgba(244,114,114,0.1); color: var(--red); border: 1px solid rgba(244,114,114,0.2); }
+  .result-indicator .ind-dot { width: 6px; height: 6px; border-radius: 50%; }
+  .result-indicator.success .ind-dot { background: var(--green); }
+  .result-indicator.fail .ind-dot { background: var(--red); }
+
+  .status-code {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px;
+    border-radius: 100px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    font-family: var(--mono);
+    margin-bottom: 10px;
+  }
+  .status-code.s2xx { background: rgba(110,231,160,0.1); color: var(--green); border: 1px solid rgba(110,231,160,0.2); }
+  .status-code.s3xx { background: rgba(245,169,98,0.1); color: var(--orange); border: 1px solid rgba(245,169,98,0.2); }
+  .status-code.s4xx { background: rgba(244,114,114,0.1); color: var(--red); border: 1px solid rgba(244,114,114,0.2); }
+  .status-code.s5xx { background: rgba(244,114,114,0.1); color: var(--red); border: 1px solid rgba(244,114,114,0.2); }
+  .status-code.serr { background: rgba(244,114,114,0.1); color: var(--red); border: 1px solid rgba(244,114,114,0.2); }
+
+  .input-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 14px;
+    align-items: stretch;
+  }
+  .input-row .query-input { flex: 1; }
+
+  /* ── Scrollbar ────────────────────────────────────────────── */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--fg-dim); }
+</style>
+</head>
+<body>
+
+<!-- Loading Overlay -->
+<div class="overlay" id="overlay">
+  <div class="overlay-box">
+    <div class="spinner"></div>
+    <h2 id="overlay-title">Loading WASM Engine</h2>
+    <p id="overlay-msg">Initializing kenkage…</p>
+  </div>
+</div>
+
+<div class="app">
+  <!-- Header -->
+  <header>
+    <div class="logo-group">
+      <div class="logo" aria-hidden="true">LP</div>
+      <div class="logo-text">
+        <h1>Kenkage Browser Kit</h1>
+        <p>HTML parser &amp; DOM — compiled to WebAssembly with Zig</p>
+      </div>
+    </div>
+    <div class="status-chips">
+      <span class="chip loading" id="chip-engine"><span class="dot"></span> Engine</span>
+      <span class="chip" id="chip-version"><span class="dot"></span> <span id="version-text">0.2.0</span></span>
+    </div>
+  </header>
+
+  <!-- Engine Stats -->
+  <div class="engine-stats">
+    <div class="stat-item">
+      <span class="stat-label">Engine version</span>
+      <span class="stat-value version" id="stat-version">0.2.0</span>
+    </div>
+    <div class="stat-item">
+      <span class="stat-label">WASM size</span>
+      <span class="stat-value">11.3 KB</span>
+    </div>
+    <div class="stat-item">
+      <span class="stat-label">Total exports</span>
+      <span class="stat-value">34</span>
+    </div>
+  </div>
+
+  <!-- Main grid -->
+  <main class="main-grid">
+    <!-- LEFT: Input -->
+    <section class="panel" aria-label="HTML Input">
+      <div class="panel-header">
+        <span class="panel-title">HTML Input</span>
+      </div>
+      <div class="panel-body">
+        <textarea id="html-input" placeholder="Paste or type HTML here…" spellcheck="false"></textarea>
+        <div class="btn-row">
+          <button class="btn btn-primary" id="btn-parse" disabled>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
+            Parse
+          </button>
+          <button class="btn btn-ghost" id="btn-sample">Load Sample</button>
+          <button class="btn btn-ghost" id="btn-clear">Clear</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- RIGHT: Results -->
+    <section class="panel" aria-label="Results">
+      <div class="panel-header">
+        <span class="panel-title">Results</span>
+        <span style="font-size:0.72rem;color:var(--fg-dim);font-family:var(--mono)" id="parse-time"></span>
+      </div>
+      <div class="panel-body">
+        <div class="tabs" role="tablist">
+          <button class="tab-btn active" data-tab="title" role="tab">Title / Text</button>
+          <button class="tab-btn" data-tab="html" role="tab">HTML</button>
+          <button class="tab-btn" data-tab="markdown" role="tab">Markdown</button>
+          <button class="tab-btn" data-tab="eval" role="tab">JS Eval</button>
+          <button class="tab-btn" data-tab="fetch" role="tab">Fetch</button>
+          <button class="tab-btn" data-tab="query" role="tab">Query</button>
+        </div>
+
+        <!-- Title / Text -->
+        <div class="tab-panel active" id="tab-title">
+          <div style="margin-bottom:12px">
+            <dt style="color:var(--fg-dim);font-size:0.72rem;text-transform:uppercase;letter-spacing:0.05em">Title</dt>
+            <dd class="code-block" id="res-title" style="margin-top:4px;min-height:36px"><span class="empty">Parse HTML to see results</span></dd>
+          </div>
+          <div>
+            <dt style="color:var(--fg-dim);font-size:0.72rem;text-transform:uppercase;letter-spacing:0.05em">Text Content</dt>
+            <dd class="code-block" id="res-text" style="margin-top:4px;min-height:60px"><span class="empty">Parse HTML to see results</span></dd>
+          </div>
+        </div>
+
+        <!-- HTML -->
+        <div class="tab-panel" id="tab-html">
+          <div class="code-block" id="res-html"><span class="empty">Parse HTML to see results</span></div>
+        </div>
+
+        <!-- Markdown -->
+        <div class="tab-panel" id="tab-markdown">
+          <div class="code-block" id="res-markdown"><span class="empty">Parse HTML to see results</span></div>
+        </div>
+
+        <!-- JS Eval -->
+        <div class="tab-panel" id="tab-eval">
+          <textarea class="code-textarea" id="eval-input" placeholder="Enter JavaScript to evaluate… e.g. 1 + 2 * 3" spellcheck="false"></textarea>
+          <div class="btn-row">
+            <button class="btn btn-primary" id="btn-eval" disabled>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+              Run
+            </button>
+          </div>
+          <div id="eval-result"></div>
+        </div>
+
+        <!-- Fetch -->
+        <div class="tab-panel" id="tab-fetch">
+          <div class="input-row">
+            <input class="query-input" id="fetch-url" placeholder="https://example.com" spellcheck="false">
+            <select class="select-input" id="fetch-method">
+              <option value="GET">GET</option>
+              <option value="POST">POST</option>
+            </select>
+            <button class="btn btn-primary" id="btn-fetch" disabled>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3.36-7"></path><polyline points="21 3 21 9 15 9"></polyline></svg>
+              Fetch
+            </button>
+          </div>
+          <div id="fetch-result"></div>
+        </div>
+
+        <!-- Query -->
+        <div class="tab-panel" id="tab-query">
+          <div class="query-row">
+            <input class="query-input" id="query-input" placeholder="CSS selector, e.g. h1, .intro, #footer a" spellcheck="false">
+            <button class="btn btn-primary" id="btn-query" disabled>Run</button>
+          </div>
+          <div id="query-results"><span class="no-results">Parse HTML first, then run a query</span></div>
+          <div id="node-detail"></div>
+        </div>
+      </div>
+      <div class="stats-bar">
+        <span>Nodes: <span class="stat-val" id="stat-nodes">—</span></span>
+        <span>Parse: <span class="stat-val" id="stat-parse">—</span></span>
+        <span>Query: <span class="stat-val" id="stat-query">—</span></span>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- ── Inline JS (ES module) ──────────────────────────────── -->
+<script type="module">
+  import { createKenkage } from '../dist/index.mjs';
+
+  // ── DOM refs ──────────────────────────────────────────────
+  const $ = (s) => document.querySelector(s);
+  const overlay      = $('#overlay');
+  const overlayTitle = $('#overlay-title');
+  const overlayMsg   = $('#overlay-msg');
+  const chipEngine   = $('#chip-engine');
+  const chipVersion  = $('#chip-version');
+  const versionText  = $('#version-text');
+  const htmlInput    = $('#html-input');
+  const btnParse     = $('#btn-parse');
+  const btnSample    = $('#btn-sample');
+  const btnClear     = $('#btn-clear');
+  const parseTimeEl  = $('#parse-time');
+  const resTitle     = $('#res-title');
+  const resText      = $('#res-text');
+  const resHtml      = $('#res-html');
+  const resMarkdown  = $('#res-markdown');
+  const queryInput   = $('#query-input');
+  const btnQuery     = $('#btn-query');
+  const queryResults = $('#query-results');
+  const nodeDetail   = $('#node-detail');
+  const statNodes    = $('#stat-nodes');
+  const statParse    = $('#stat-parse');
+  const statQuery    = $('#stat-query');
+  const evalInput    = $('#eval-input');
+  const btnEval      = $('#btn-eval');
+  const evalResult   = $('#eval-result');
+  const fetchUrl     = $('#fetch-url');
+  const fetchMethod  = $('#fetch-method');
+  const btnFetch     = $('#btn-fetch');
+  const fetchResult  = $('#fetch-result');
+
+  let engine = null;
+  let selectedNodeId = null;
+
+  // ── Sample HTML ───────────────────────────────────────────
+  const SAMPLE_HTML = `<html>
+<head>
+  <title>Kenkage Demo</title>
+  <meta charset="utf-8">
+</head>
+<body>
+  <header>
+    <h1 id="main-title">Hello, Kenkage!</h1>
+    <p class="subtitle">A browser engine compiled to <strong>WebAssembly</strong> with <a href="https://ziglang.org">Zig</a>.</p>
+  </header>
+  <main>
+    <section class="features">
+      <h2>Features</h2>
+      <ul>
+        <li>HTML5 parsing</li>
+        <li>CSS selector queries</li>
+        <li>Text extraction</li>
+        <li>Markdown conversion</li>
+      </ul>
+    </section>
+    <section class="about">
+      <h2>About</h2>
+      <p>This test app demonstrates the <code>kenkage</code> library.</p>
+      <p>Try editing the HTML on the left and clicking <em>Parse</em>!</p>
+    </section>
+  </main>
+  <footer>
+    <p class="small">Built with Zig + WebAssembly</p>
+  </footer>
+</body>
+</html>`;
+
+  // ── Tab switching ─────────────────────────────────────────
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+      btn.classList.add('active');
+      $(`#tab-${btn.dataset.tab}`).classList.add('active');
+    });
+  });
+
+  // ── Helpers ───────────────────────────────────────────────
+  function esc(str) {
+    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  function setCodeBlock(el, text) {
+    if (!text) {
+      el.innerHTML = '<span class="empty">(empty)</span>';
+      el.classList.add('empty');
+    } else {
+      el.textContent = text;
+      el.classList.remove('empty');
+    }
+  }
+
+  function formatMs(ns) {
+    if (ns < 1e3) return `${ns}ns`;
+    if (ns < 1e6) return `${(ns / 1e3).toFixed(1)}μs`;
+    return `${(ns / 1e6).toFixed(2)}ms`;
+  }
+
+  // ── Init engine ───────────────────────────────────────────
+  try {
+    engine = await createKenkage();
+    await engine.init();
+
+    // Success
+    versionText.textContent = `v${engine.version}`;
+    chipVersion.classList.add('ready');
+    chipEngine.classList.remove('loading');
+    chipEngine.classList.add('ready');
+
+    btnParse.disabled = false;
+    btnQuery.disabled = false;
+    btnEval.disabled = false;
+    btnFetch.disabled = false;
+
+    // Hide overlay
+    overlay.classList.add('hidden');
+    setTimeout(() => overlay.remove(), 500);
+  } catch (err) {
+    overlayTitle.textContent = 'Failed to load';
+    overlayMsg.innerHTML = `<span class="err">${esc(err.message)}</span>`;
+    chipEngine.classList.remove('loading');
+    chipEngine.classList.add('error');
+  }
+
+  // ── Parse ─────────────────────────────────────────────────
+  btnParse.addEventListener('click', () => {
+    if (!engine) return;
+    const html = htmlInput.value;
+    if (!html.trim()) return;
+
+    // Measure perf
+    const t0 = performance.now();
+    const ok = engine.parse(html);
+    const t1 = performance.now();
+    const elapsed = (t1 - t0) * 1e6; // → nanoseconds-ish for display
+
+    if (!ok) {
+      queryResults.innerHTML = '<span class="no-results">Parse returned false</span>';
+      return;
+    }
+
+    // Update results
+    setCodeBlock(resTitle, engine.getTitle());
+    setCodeBlock(resText, engine.getText());
+    setCodeBlock(resHtml, engine.getHtml());
+    setCodeBlock(resMarkdown, engine.getMarkdown());
+
+    const nodeCount = engine.getNodeCount();
+    statNodes.textContent = nodeCount;
+    statParse.textContent = formatMs(elapsed);
+    parseTimeEl.textContent = formatMs(elapsed);
+
+    // Reset query panel
+    nodeDetail.innerHTML = '';
+    queryResults.innerHTML = '<span class="no-results">Enter a CSS selector above</span>';
+    selectedNodeId = null;
+  });
+
+  // ── Query ─────────────────────────────────────────────────
+  function runQuery() {
+    if (!engine) return;
+    const selector = queryInput.value.trim();
+    if (!selector) return;
+
+    const t0 = performance.now();
+    const ids = engine.querySelector(selector);
+    const t1 = performance.now();
+    statQuery.textContent = `${ids.length} results · ${formatMs((t1 - t0) * 1e6)}`;
+
+    if (ids.length === 0) {
+      queryResults.innerHTML = '<span class="no-results">No elements found</span>';
+      nodeDetail.innerHTML = '';
+      return;
+    }
+
+    const list = document.createElement('ul');
+    list.className = 'node-list';
+    for (const id of ids) {
+      const tag = engine.nodeTag(id);
+      const text = engine.nodeText(id);
+      const li = document.createElement('li');
+      li.className = 'node-item';
+      if (id === selectedNodeId) li.classList.add('selected');
+      li.innerHTML = `<span class="node-id">#${id}</span><span class="node-tag-name">&lt;${esc(tag)}&gt;</span><span class="node-text-preview">${esc(text.substring(0, 60))}</span>`;
+      li.addEventListener('click', () => showNodeDetail(id));
+      list.appendChild(li);
+    }
+    queryResults.innerHTML = '';
+    queryResults.appendChild(list);
+  }
+
+  btnQuery.addEventListener('click', runQuery);
+  queryInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') runQuery(); });
+
+  function showNodeDetail(id) {
+    if (!engine) return;
+    selectedNodeId = id;
+
+    // Re-highlight selected
+    document.querySelectorAll('.node-item').forEach(el => el.classList.remove('selected'));
+    event.currentTarget.classList.add('selected');
+
+    const tag = engine.nodeTag(id);
+    const text = engine.nodeText(id);
+    const childCount = engine.nodeChildCount(id);
+
+    // Collect common attributes
+    const attrNames = ['id', 'class', 'href', 'src', 'alt', 'title', 'type', 'name', 'value', 'style', 'data-*'];
+    let attrsHtml = '';
+    for (const name of attrNames) {
+      if (name === 'data-*') continue;
+      const val = engine.nodeAttr(id, name);
+      if (val) {
+        attrsHtml += `<tr><td class="attr-name">${esc(name)}</td><td>${esc(val)}</td></tr>`;
+      }
+    }
+
+    nodeDetail.innerHTML = `
+      <div class="node-detail">
+        <dl>
+          <dt>Node ID</dt><dd>#${id}</dd>
+          <dt>Tag</dt><dd><span class="node-tag-name">&lt;${esc(tag)}&gt;</span></dd>
+          <dt>Text</dt><dd>${esc(text) || '<span style="color:var(--fg-dim)">(none)</span>'}</dd>
+          <dt>Children</dt><dd>${childCount}</dd>
+          ${attrsHtml ? `<dt>Attributes</dt><dd><table class="attr-table">${attrsHtml}</table></dd>` : ''}
+        </dl>
+      </div>
+    `;
+  }
+
+  // ── JS Eval ─────────────────────────────────────────────
+  async function runEval() {
+    if (!engine) return;
+    const code = evalInput.value.trim();
+    if (!code) return;
+
+    btnEval.disabled = true;
+    evalResult.innerHTML = '<span class="no-results">Evaluating…</span>';
+
+    try {
+      const res = await engine.eval(code);
+      if (res.success) {
+        evalResult.innerHTML = `
+          <div class="result-indicator success"><span class="ind-dot"></span> success</div>
+          <div class="code-block">${esc(res.result)}</div>
+        `;
+      } else {
+        evalResult.innerHTML = `
+          <div class="result-indicator fail"><span class="ind-dot"></span> fail</div>
+          <div class="code-block">${esc(res.result)}</div>
+        `;
+      }
+    } catch (err) {
+      evalResult.innerHTML = `
+        <div class="result-indicator fail"><span class="ind-dot"></span> error</div>
+        <div class="code-block">${esc(err.message)}</div>
+      `;
+    }
+
+    btnEval.disabled = false;
+  }
+
+  btnEval.addEventListener('click', runEval);
+  evalInput.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      e.preventDefault();
+      runEval();
+    }
+  });
+
+  // ── Fetch ────────────────────────────────────────────────
+  async function runFetch() {
+    if (!engine) return;
+    const url = fetchUrl.value.trim();
+    if (!url) return;
+
+    btnFetch.disabled = true;
+    fetchResult.innerHTML = '<span class="no-results">Fetching…</span>';
+
+    try {
+      const opts = { method: fetchMethod.value };
+      const res = await engine.fetch(url, opts);
+
+      const statusCls = res.status >= 200 && res.status < 300 ? 's2xx'
+        : res.status >= 300 && res.status < 400 ? 's3xx'
+        : res.status >= 400 && res.status < 500 ? 's4xx'
+        : 's5xx';
+
+      const MAX_BODY = 4096;
+      const bodyText = res.body.length > MAX_BODY
+        ? res.body.substring(0, MAX_BODY) + '\n\n… (truncated, ' + res.body.length + ' chars total)'
+        : res.body;
+
+      fetchResult.innerHTML = `
+        <div class="status-code ${statusCls}">${res.status}</div>
+        <div class="code-block">${esc(bodyText)}</div>
+      `;
+    } catch (err) {
+      fetchResult.innerHTML = `
+        <div class="status-code serr">ERR</div>
+        <div class="code-block">${esc(err.message)}</div>
+      `;
+    }
+
+    btnFetch.disabled = false;
+  }
+
+  btnFetch.addEventListener('click', runFetch);
+  fetchUrl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') runFetch();
+  });
+
+  // ── Sample / Clear ────────────────────────────────────────
+  btnSample.addEventListener('click', () => {
+    htmlInput.value = SAMPLE_HTML;
+    btnParse.click();
+  });
+
+  btnClear.addEventListener('click', () => {
+    htmlInput.value = '';
+    setCodeBlock(resTitle, '');
+    setCodeBlock(resText, '');
+    setCodeBlock(resHtml, '');
+    setCodeBlock(resMarkdown, '');
+    resTitle.innerHTML = '<span class="empty">Parse HTML to see results</span>';
+    resText.innerHTML  = '<span class="empty">Parse HTML to see results</span>';
+    resHtml.innerHTML  = '<span class="empty">Parse HTML to see results</span>';
+    resMarkdown.innerHTML = '<span class="empty">Parse HTML to see results</span>';
+    queryResults.innerHTML = '<span class="no-results">Parse HTML first, then run a query</span>';
+    nodeDetail.innerHTML = '';
+    evalResult.innerHTML = '';
+    fetchResult.innerHTML = '';
+    statNodes.textContent = '—';
+    statParse.textContent = '—';
+    statQuery.textContent = '—';
+    parseTimeEl.textContent = '';
+  });
+
+  // ── Keyboard shortcut: Ctrl+Enter to parse ─────────────────
+  htmlInput.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      e.preventDefault();
+      btnParse.click();
+    }
+  });
+</script>
+</body>
+</html>
