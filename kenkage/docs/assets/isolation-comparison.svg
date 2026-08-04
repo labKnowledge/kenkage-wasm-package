@@ -1,0 +1,141 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 580" width="960" height="580" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <style>
+      .eyebrow { font-size: 11px; letter-spacing: 1.5px; fill: #6b7095; font-weight: 600; }
+      .colname { font-size: 17px; fill: #e7e9f3; font-weight: 700; }
+      .rowlabel { font-size: 13px; fill: #c7cade; }
+      .caption { font-size: 12px; fill: #9598b3; }
+      .tiny { font-size: 9px; fill: #8b8fa5; }
+      .tinybold { font-size: 9px; fill: #7c8aff; font-weight: 700; letter-spacing: 1px; }
+    </style>
+  </defs>
+
+  <!-- background -->
+  <rect x="1" y="1" width="958" height="578" rx="20" fill="#0e0f13" stroke="#2a2b35" stroke-width="1"/>
+
+  <!-- title -->
+  <text x="480" y="46" text-anchor="middle" font-size="24" font-weight="700" fill="#f0f1f8">Where does the isolation actually come from?</text>
+  <text x="480" y="70" text-anchor="middle" class="caption">Three ways to let code you don't control touch a page</text>
+
+  <!-- ================= COLUMN 1: Headless browser ================= -->
+  <g transform="translate(40,100)">
+    <rect width="280" height="440" rx="14" fill="#16171d" stroke="#2a2b35" stroke-width="1.5"/>
+    <text x="140" y="34" text-anchor="middle" class="eyebrow">HEADLESS BROWSER</text>
+
+    <!-- icon: browser window -->
+    <g transform="translate(140,52)">
+      <rect x="-48" y="0" width="96" height="58" rx="7" fill="#1c1d25" stroke="#2a2b35" stroke-width="1.5"/>
+      <line x1="-48" y1="15" x2="48" y2="15" stroke="#2a2b35" stroke-width="1"/>
+      <circle cx="-38" cy="7.5" r="2.6" fill="#f87171"/>
+      <circle cx="-30" cy="7.5" r="2.6" fill="#fbbf24"/>
+      <circle cx="-22" cy="7.5" r="2.6" fill="#4ade80"/>
+      <text x="0" y="40" text-anchor="middle" class="tiny">Chromium process</text>
+
+      <!-- dashed network link down to agent -->
+      <line x1="0" y1="58" x2="0" y2="86" stroke="#555872" stroke-width="1.5" stroke-dasharray="3,3"/>
+      <path d="M -5,68 L 0,62 L 5,68" fill="none" stroke="#555872" stroke-width="1.5"/>
+      <path d="M -5,78 L 0,84 L 5,78" fill="none" stroke="#555872" stroke-width="1.5"/>
+
+      <rect x="-32" y="86" width="64" height="26" rx="5" fill="#1c1d25" stroke="#2a2b35" stroke-width="1.5"/>
+      <text x="0" y="103" text-anchor="middle" class="tiny">your agent</text>
+    </g>
+
+    <text x="140" y="240" text-anchor="middle" class="colname">Playwright / Puppeteer</text>
+    <line x1="24" y1="256" x2="256" y2="256" stroke="#2a2b35" stroke-width="1"/>
+
+    <!-- row: isolated -->
+    <g transform="translate(24,272)">
+      <circle cx="9" cy="9" r="9" fill="#4ade8026" stroke="#4ade80" stroke-width="1.3"/>
+      <path d="M5,9 L8,12 L13,5" fill="none" stroke="#4ade80" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="26" y="13" class="rowlabel">Real isolation boundary</text>
+    </g>
+    <!-- row: embeddable -->
+    <g transform="translate(24,302)">
+      <circle cx="9" cy="9" r="9" fill="#f8717126" stroke="#f87171" stroke-width="1.3"/>
+      <path d="M5,5 L13,13 M13,5 L5,13" stroke="#f87171" stroke-width="2" stroke-linecap="round"/>
+      <text x="26" y="13" class="rowlabel">Runs in your own process</text>
+    </g>
+
+    <text x="24" y="358" class="caption">Isolated — because it's a whole</text>
+    <text x="24" y="375" class="caption">separate browser binary you drive</text>
+    <text x="24" y="392" class="caption">over a wire, not code in your process.</text>
+  </g>
+
+  <!-- ================= COLUMN 2: DOM shim ================= -->
+  <g transform="translate(340,100)">
+    <rect width="280" height="440" rx="14" fill="#16171d" stroke="#2a2b35" stroke-width="1.5"/>
+    <text x="140" y="34" text-anchor="middle" class="eyebrow">DOM SHIM</text>
+
+    <!-- icon: your process box with broken lock -->
+    <g transform="translate(140,52)">
+      <rect x="-55" y="0" width="110" height="90" rx="8" fill="#1c1d25" stroke="#2a2b35" stroke-width="1.5"/>
+      <text x="0" y="16" text-anchor="middle" class="tiny">your process</text>
+
+      <!-- broken/open lock -->
+      <g transform="translate(0,58)">
+        <path d="M -7,-4 v-9 a7,7 0 0 1 11,-5" fill="none" stroke="#f87171" stroke-width="2.6" stroke-linecap="round"/>
+        <rect x="-10" y="-4" width="20" height="16" rx="3" fill="none" stroke="#f87171" stroke-width="2" stroke-dasharray="2.5,3"/>
+      </g>
+    </g>
+
+    <text x="140" y="240" text-anchor="middle" class="colname">jsdom / happy-dom</text>
+    <line x1="24" y1="256" x2="256" y2="256" stroke="#2a2b35" stroke-width="1"/>
+
+    <g transform="translate(24,272)">
+      <circle cx="9" cy="9" r="9" fill="#f8717126" stroke="#f87171" stroke-width="1.3"/>
+      <path d="M5,5 L13,13 M13,5 L5,13" stroke="#f87171" stroke-width="2" stroke-linecap="round"/>
+      <text x="26" y="13" class="rowlabel">Real isolation boundary</text>
+    </g>
+    <g transform="translate(24,302)">
+      <circle cx="9" cy="9" r="9" fill="#4ade8026" stroke="#4ade80" stroke-width="1.3"/>
+      <path d="M5,9 L8,12 L13,5" fill="none" stroke="#4ade80" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="26" y="13" class="rowlabel">Runs in your own process</text>
+    </g>
+
+    <text x="24" y="358" class="caption">Embeddable — but not sandboxed.</text>
+    <text x="24" y="375" class="caption">Documented: untrusted JS escapes</text>
+    <text x="24" y="392" class="caption">via prototype pollution.</text>
+  </g>
+
+  <!-- ================= COLUMN 3: kenkage ================= -->
+  <g transform="translate(640,100)">
+    <rect width="280" height="440" rx="14" fill="#16171d" stroke="#7c8aff" stroke-width="2"/>
+    <text x="140" y="34" text-anchor="middle" class="tinybold">KENKAGE</text>
+
+    <!-- icon: your process box containing a WASM box with solid lock -->
+    <g transform="translate(140,52)">
+      <rect x="-55" y="0" width="110" height="90" rx="8" fill="#1c1d25" stroke="#2a2b35" stroke-width="1.5"/>
+      <text x="0" y="16" text-anchor="middle" class="tiny">your process</text>
+
+      <rect x="-38" y="24" width="76" height="54" rx="7" fill="#20223a" stroke="#7c8aff" stroke-width="1.6"/>
+      <text x="0" y="37" text-anchor="middle" class="tinybold" font-size="8">WASM</text>
+
+      <!-- solid closed lock -->
+      <g transform="translate(0,58)">
+        <path d="M -7,-4 v-6 a7,7 0 0 1 14,0 v6" fill="none" stroke="#7c8aff" stroke-width="2.6" stroke-linecap="round"/>
+        <rect x="-10" y="-4" width="20" height="15" rx="3" fill="#7c8aff"/>
+        <circle cx="0" cy="3" r="1.5" fill="#0e0f13"/>
+      </g>
+    </g>
+
+    <text x="140" y="240" text-anchor="middle" class="colname">kenkage</text>
+    <line x1="24" y1="256" x2="256" y2="256" stroke="#2a2b35" stroke-width="1"/>
+
+    <g transform="translate(24,272)">
+      <circle cx="9" cy="9" r="9" fill="#4ade8026" stroke="#4ade80" stroke-width="1.3"/>
+      <path d="M5,9 L8,12 L13,5" fill="none" stroke="#4ade80" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="26" y="13" class="rowlabel">Real isolation boundary</text>
+    </g>
+    <g transform="translate(24,302)">
+      <circle cx="9" cy="9" r="9" fill="#4ade8026" stroke="#4ade80" stroke-width="1.3"/>
+      <path d="M5,9 L8,12 L13,5" fill="none" stroke="#4ade80" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="26" y="13" class="rowlabel">Runs in your own process</text>
+    </g>
+
+    <text x="24" y="358" class="caption">Isolated AND embeddable — WASM's</text>
+    <text x="24" y="375" class="caption">linear memory is the boundary, so</text>
+    <text x="24" y="392" class="caption">it holds wherever the module runs.</text>
+  </g>
+
+  <text x="480" y="565" text-anchor="middle" font-size="15" font-weight="700" fill="#7c8aff">kenkage is the only one that checks both boxes.</text>
+</svg>

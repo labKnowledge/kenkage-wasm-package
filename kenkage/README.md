@@ -1,5 +1,7 @@
 # kenkage
 
+![Where does the isolation actually come from — a comparison of headless browsers, DOM shims, and kenkage](docs/assets/isolation-comparison.svg)
+
 **We believe an agent's isolation shouldn't depend on how carefully you
 babysit it — it should be a property of where its code physically runs.**
 
