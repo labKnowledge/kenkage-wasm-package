@@ -189,3 +189,80 @@ describe('loadPage — ES module scripts', () => {
     expect(calls['https://b.example.com/x.js']).toBe(1);
   });
 });
+
+describe('loadPage — dynamic import()', () => {
+  it('resolves and executes a literal-argument dynamic import()', async () => {
+    const html = `<html><body>
+      <script type="module">
+        const mod = await import('./lazy.js');
+        mod.mark();
+      </script>
+    </body></html>`;
+    const lazyJs = `export function mark() { document.body.setAttribute('data-ran', 'dynamic'); }`;
+    const { fetchFn, calls } = makeFetchMock({
+      'https://example.com/': html,
+      'https://example.com/lazy.js': lazyJs,
+    });
+
+    const result = await engine.loadPage('https://example.com/', { fetchFn });
+
+    expect(result.scriptErrors).toEqual([]);
+    expect(result.html).toContain('data-ran="dynamic"');
+    expect(calls['https://example.com/lazy.js']).toBe(1);
+  });
+
+  it('eagerly pre-fetches every literal dynamic-import candidate reachable in source, even ones never invoked', async () => {
+    // Mirrors how Vite compiles import.meta.glob()-based route splitting:
+    // a lookup object of `() => import('literal/path.js')` thunks, only
+    // one of which actually runs at runtime.
+    const html = `<html><body>
+      <script type="module" src="/router.js"></script>
+    </body></html>`;
+    const routerJs = `
+      const pages = {
+        home: () => import('./pages/home.js'),
+        about: () => import('./pages/about.js'),
+      };
+      const mod = await pages['home']();
+      mod.render();
+    `;
+    const homeJs = `export function render() { document.body.setAttribute('data-page', 'home'); }`;
+    const aboutJs = `export function render() { document.body.setAttribute('data-page', 'about'); }`;
+    const { fetchFn, calls } = makeFetchMock({
+      'https://example.com/': html,
+      'https://example.com/router.js': routerJs,
+      'https://example.com/pages/home.js': homeJs,
+      'https://example.com/pages/about.js': aboutJs,
+    });
+
+    const result = await engine.loadPage('https://example.com/', { fetchFn });
+
+    expect(result.scriptErrors).toEqual([]);
+    expect(result.html).toContain('data-page="home"');
+    // Both candidates get pre-fetched even though only "home" actually ran
+    // — the documented eager-prefetch trade-off that makes dynamic
+    // import() work without knowing in advance which branch executes.
+    expect(calls['https://example.com/pages/home.js']).toBe(1);
+    expect(calls['https://example.com/pages/about.js']).toBe(1);
+  });
+
+  it('rejects (catchably, not a crash) a computed dynamic import specifier the crawler could not see', async () => {
+    const html = `<html><body>
+      <script type="module">
+        const name = 'home';
+        try {
+          await import(\`./pages/\${name}.js\`);
+          document.body.setAttribute('data-outcome', 'resolved');
+        } catch (e) {
+          document.body.setAttribute('data-outcome', 'rejected');
+        }
+      </script>
+    </body></html>`;
+    const { fetchFn } = makeFetchMock({ 'https://example.com/': html });
+
+    const result = await engine.loadPage('https://example.com/', { fetchFn });
+
+    expect(result.scriptErrors).toEqual([]);
+    expect(result.html).toContain('data-outcome="rejected"');
+  });
+});

@@ -92,15 +92,12 @@ static void kk_clear_modules(void);
 static JSModuleDef *kk_module_loader(JSContext *ctx, const char *module_name, void *opaque);
 static char *kk_module_normalize(JSContext *ctx, const char *base_name, const char *name, void *opaque);
 
-int qjs_init(void) {
-    g_rt = JS_NewRuntime();
-    if (!g_rt) return 0;
+/* Creates g_ctx (g_rt must already exist) with DOM bindings and the module
+ * loader wired up. Shared by qjs_init (first-ever setup) and qjs_reset
+ * (a fresh context for a new page load on an already-running engine). */
+static int kk_init_context(void) {
     g_ctx = JS_NewContext(g_rt);
-    if (!g_ctx) {
-        JS_FreeRuntime(g_rt);
-        g_rt = NULL;
-        return 0;
-    }
+    if (!g_ctx) return 0;
     setup_dom_bindings(g_ctx);
     /* Registered after the DOM prelude so kk_module_normalize's `URL` lookup
      * (used only when a module is actually loaded, i.e. after init has
@@ -109,9 +106,40 @@ int qjs_init(void) {
     return 1;
 }
 
+int qjs_init(void) {
+    g_rt = JS_NewRuntime();
+    if (!g_rt) return 0;
+    if (!kk_init_context()) {
+        JS_FreeRuntime(g_rt);
+        g_rt = NULL;
+        return 0;
+    }
+    return 1;
+}
+
 void qjs_destroy(void) {
     if (g_ctx) { kk_clear_modules(); JS_FreeContext(g_ctx); g_ctx = NULL; }
     if (g_rt) { JS_FreeRuntime(g_rt); g_rt = NULL; }
+}
+
+/* Tears down and recreates the JS context (keeping the runtime) so a new
+ * page load starts from a genuinely clean realm — no leftover globals,
+ * timers, listeners, or (critically) QuickJS's own internal loaded-module
+ * cache, which is keyed by resolved specifier and would otherwise silently
+ * hand back an already-evaluated module from a *previous* loadPage() call
+ * whenever two page loads happen to resolve the same import URL. Matches
+ * how a real browser tab gets a fresh realm on every navigation. */
+int qjs_reset(void) {
+    if (g_ctx) {
+        kk_clear_modules();
+        JS_FreeContext(g_ctx);
+        g_ctx = NULL;
+    }
+    if (!g_rt) {
+        g_rt = JS_NewRuntime();
+        if (!g_rt) return 0;
+    }
+    return kk_init_context();
 }
 
 int qjs_eval(const char *code, int code_len) {

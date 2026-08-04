@@ -92,6 +92,7 @@ const Document = struct {
 
 extern fn qjs_init() c_int;
 extern fn qjs_destroy() void;
+extern fn qjs_reset() c_int;
 extern fn qjs_eval(code: [*]const u8, code_len: c_int) c_int;
 extern fn qjs_get_result() [*]const u8;
 extern fn qjs_get_result_len() c_int;
@@ -948,6 +949,13 @@ export fn kk_js_init() c_int {
 
 export fn kk_js_destroy() void {
     qjs_destroy();
+}
+
+/// Tears down and recreates the JS context (runtime kept) — gives a new
+/// loadPage() call a genuinely fresh realm, clearing QuickJS's own
+/// internal loaded-module cache along with all globals/timers/listeners.
+export fn kk_js_reset() c_int {
+    return qjs_reset();
 }
 
 export fn kk_js_eval(code_ptr: [*]const u8, code_len: u32) c_int {

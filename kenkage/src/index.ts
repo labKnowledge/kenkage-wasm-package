@@ -51,15 +51,18 @@ export interface KenkageWasm {
    * Only available with `engine: 'full'` — the 'core' build has no JS
    * engine to run scripts on, so this throws if called on it.
    *
-   * `<script type="module">` is executed as a real ES module: static
-   * `import`/`export` specifiers are crawled and pre-fetched (recursively,
+   * `<script type="module">` is executed as a real ES module: every
+   * `import`/`export from` specifier and every literal-argument dynamic
+   * `import("...")` call — including ones sitting inside functions that
+   * only run conditionally, e.g. Vite's compiled `import.meta.glob`
+   * route-splitting output — is crawled and pre-fetched (recursively,
    * deduped across the page) before evaluation, since QuickJS's module
    * loader is synchronous and can't itself await a network round-trip.
-   * Specifiers a static crawl can't see — bare specifiers with no import
-   * map, or ones behind computed/dynamic `import(...)` — surface as a
-   * ReferenceError in `scriptErrors` rather than being resolved. Only
-   * `<script type="importmap">` and other non-executable types still land
-   * in `scriptsSkipped`.
+   * Only specifiers built from computed values or template literals
+   * (`import(\`./pages/${name}.js\`)`) can't be seen this way — those
+   * surface as a ReferenceError (static) or a rejected Promise (dynamic)
+   * instead of being resolved. `<script type="importmap">` and other
+   * non-executable types land in `scriptsSkipped`.
    */
   loadPage(url: string, options?: LoadPageOptions): Promise<LoadPageResult>;
   /** Engine version string (available before init). */
@@ -143,6 +146,7 @@ interface WasmExports {
   // Present only in the 'full' engine build (real in-WASM QuickJS).
   kk_js_init?: () => number;
   kk_js_destroy?: () => void;
+  kk_js_reset?: () => number;
   kk_js_eval?: (code_ptr: number, code_len: number) => number;
   kk_js_get_result?: () => number;
   kk_js_get_result_len?: () => number;
@@ -460,21 +464,31 @@ export async function createKenkage(
   }
 
   /**
-   * Extracts static import specifiers from ES module source. Deliberately
-   * simple regex matching rather than full lexing/parsing — covers
-   * `import ... from "spec"`, `export ... from "spec"`, and bare
-   * `import "spec"`, which is what real-world bundler output overwhelmingly
-   * uses. Misses specifiers hidden behind computed values or dynamic
-   * `import(...)` calls — a known, documented limitation (see
-   * crawlModuleGraph below).
+   * Extracts import specifiers from ES module source — both static
+   * (`import ... from "spec"`, `export ... from "spec"`, bare
+   * `import "spec"`) and dynamic `import("spec")` calls with a
+   * string-literal argument. Deliberately simple regex matching rather
+   * than full lexing/parsing, but this covers real-world bundler output
+   * surprisingly well: a dynamic `import(...)` call sitting inside a
+   * function body that only runs conditionally at runtime (e.g. Vite's
+   * compiled output for `import.meta.glob`, used for route-level code
+   * splitting) still has its specifier as a literal string *in the
+   * source text* — pre-fetching it here means QuickJS's (synchronous)
+   * module loader already has it by the time that `import()` actually
+   * executes, even though nothing "statically" imports it in the ESM
+   * sense. Only specifiers built from computed values or template
+   * literals (`import(\`./pages/${name}.js\`)`) can't be seen this way —
+   * a known, documented limitation (see crawlModuleGraph below).
    */
   function extractImportSpecifiers(code: string): string[] {
     const specifiers = new Set<string>();
     const fromRe = /\bfrom\s*['"]([^'"]+)['"]/g;
     const bareImportRe = /\bimport\s*['"]([^'"]+)['"]/g;
+    const dynamicImportRe = /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
     let m: RegExpExecArray | null;
     while ((m = fromRe.exec(code))) specifiers.add(m[1]);
     while ((m = bareImportRe.exec(code))) specifiers.add(m[1]);
+    while ((m = dynamicImportRe.exec(code))) specifiers.add(m[1]);
     return [...specifiers];
   }
 
@@ -527,17 +541,26 @@ export async function createKenkage(
   }
 
   /**
-   * Crawls a module's static import graph — fetching and registering every
-   * dependency it (transitively) statically imports — before evaluation.
-   * QuickJS's module loader callback is synchronous: it can't itself
-   * suspend behind a Promise the way fetch() does via drainPendingFetches,
-   * so the whole graph must be fetched and registered up front. `visited`
-   * is shared across every `<script type="module">` on a page, so common
-   * dependencies (shared chunks, vendor bundles) are only fetched once.
+   * Crawls a module's import graph — fetching and registering every
+   * dependency it (transitively) imports, static or literal-argument
+   * dynamic `import(...)` — before evaluation. QuickJS's module loader
+   * callback is synchronous: it can't itself suspend behind a Promise the
+   * way fetch() does via drainPendingFetches, so the whole reachable graph
+   * must be fetched and registered up front. Since dynamic import()
+   * specifiers are extracted from source text regardless of which
+   * function body they're sitting in (see extractImportSpecifiers), this
+   * eagerly pre-fetches every module a page *might* dynamically load, not
+   * only the ones actually invoked at runtime — deliberately trading
+   * extra network requests for dynamic import() actually working, since
+   * there's no way to know in advance which literal-specifier branches
+   * real execution will take. `visited` is shared across every
+   * `<script type="module">` on a page, so common dependencies (shared
+   * chunks, vendor bundles) are only fetched once.
    *
-   * Specifiers that fail to resolve (bare specifiers with no import map)
-   * are left alone — evalModule()/the loader will surface a clear
-   * ReferenceError for them rather than this throwing here.
+   * Specifiers that fail to resolve (bare specifiers with no import map,
+   * or ones this fetch pass couldn't reach) are left alone — evalModule()/
+   * the loader will surface a clear ReferenceError (static) or a rejected
+   * Promise (dynamic) for them rather than this throwing here.
    */
   async function crawlModuleGraph(
     entryUrl: string,
@@ -806,6 +829,18 @@ export async function createKenkage(
       }
       const doFetch = options?.fetchFn ?? ((u: string) => api.fetch(u));
 
+      // A page load gets a genuinely fresh JS realm — no leftover globals,
+      // timers, listeners, or (critically) QuickJS's own internal
+      // loaded-module cache from a previous loadPage() call, which is
+      // keyed by resolved specifier and would otherwise silently hand back
+      // an already-evaluated module whenever two page loads happen to
+      // resolve the same import URL. Matches a real browser tab getting a
+      // fresh realm on every navigation. ensureJsEngine() first covers the
+      // very-first-ever call (nothing to reset yet); kk_js_reset() then
+      // unconditionally recreates the context.
+      ensureJsEngine();
+      exports.kk_js_reset?.();
+
       const { status, body } = await doFetch(url);
       api.parse(body);
 
@@ -813,10 +848,10 @@ export async function createKenkage(
       let scriptsExecuted = 0;
       const scriptsSkipped: { src?: string; reason: string }[] = [];
       const scriptErrors: { src?: string; message: string }[] = [];
-      // Fresh module table for this page load, and one import-graph
-      // dedup set shared across every module script on the page so common
-      // dependencies are only fetched once. See crawlModuleGraph above.
-      exports.kk_js_clear_modules?.();
+      // Import-graph dedup set shared across every module script on the
+      // page so common dependencies are only fetched once. See
+      // crawlModuleGraph above. (The module source table itself was
+      // already cleared by kk_js_reset() above.)
       const moduleVisited = new Set<string>();
 
       for (const id of scriptIds) {
