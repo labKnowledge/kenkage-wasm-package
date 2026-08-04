@@ -1,6 +1,6 @@
 {
   "name": "kenkage",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Sandboxed browser engine (DOM + real QuickJS) compiled to WebAssembly — parse HTML, query the DOM, and run untrusted JavaScript on-device, in the browser, with no server round-trip",
   "homepage": "https://github.com/labKnowledge/kenkage-wasm-package/tree/main/kenkage#readme",
   "repository": {

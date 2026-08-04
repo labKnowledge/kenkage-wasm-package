@@ -175,6 +175,16 @@ running code — for esbuild specifically, marking `kenkage` as `--external`
 (so it's `require`/`import`-resolved normally at runtime instead of
 inlined) avoids the problem entirely, if your setup allows it.
 
+kenkage's Node-only code path (`fs.readFileSync`, gated behind a runtime
+`isNode` check) is reached via a dynamically-computed `import()` specifier
+rather than a literal `import('node:fs')`, specifically so bundlers don't
+try to eagerly resolve it at build time when bundling kenkage for a
+browser target that lacks `node:fs`. If you're on kenkage < 0.1.3 and hit
+`Could not resolve "node:fs"` while bundling for a browser/non-Node
+platform, upgrade — this is otherwise unavoidable in that pattern with a
+literal specifier, since bundlers can't know a dynamic import is
+runtime-guarded and unreachable on your target platform.
+
 Point it at wherever kenkage's `dist/` actually ends up in your build output.
 
 ## `core` vs `full`

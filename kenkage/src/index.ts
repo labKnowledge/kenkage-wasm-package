@@ -165,6 +165,18 @@ const isNode =
   process.versions != null &&
   process.versions.node != null;
 
+/**
+ * Computed (not literal) so bundlers can't statically resolve this dynamic
+ * import at build time. A literal `import('node:fs')` is eagerly resolved
+ * by esbuild/webpack even though it's dynamic and guarded by `isNode` at
+ * runtime — bundling for a browser target (no `node:fs`) then fails at
+ * build time with "Could not resolve 'node:fs'", even though the guarded
+ * branch would never actually execute in a browser. Concatenating the
+ * specifier at runtime defeats that static analysis; the resolved value
+ * ("node:fs") and Node's actual module resolution are unaffected.
+ */
+const NODE_FS_SPECIFIER = 'node' + ':' + 'fs';
+
 // ── WASM URL resolution ───────────────────────────────────────────
 
 /**
@@ -283,7 +295,7 @@ export async function createKenkage(
   // Load WASM bytes
   let wasmSource: Uint8Array;
   if (isNode) {
-    const fs = await import('node:fs');
+    const fs = await import(NODE_FS_SPECIFIER);
     let filePath: string;
     if (wasmUrl.startsWith('file://')) {
       filePath = new URL(wasmUrl).pathname;
