@@ -163,6 +163,44 @@ int qjs_eval(const char *code, int code_len) {
         return -1;
     }
 
+    /* A top-level `(async () => { ... })()` (or any expression producing a
+     * Promise) completes *synchronously* with the pending Promise itself —
+     * same as a real JS host. Callers evaluating one-off snippets almost
+     * always want the eventually-settled value instead (what `await` at a
+     * REPL prompt gives you), so drain jobs until it settles and unwrap it
+     * here, before stringifying. Bounded so a Promise nothing will ever
+     * settle (e.g. one still waiting on a fetch() the host hasn't answered)
+     * can't hang eval forever — it just falls through and stringifies the
+     * still-pending Promise as before. */
+    JSPromiseStateEnum promise_state = JS_PromiseState(g_ctx, val);
+    if (promise_state != -1) {
+        for (int guard = 0; guard < 10000 && promise_state == JS_PROMISE_PENDING; guard++) {
+            JSContext *job_ctx;
+            int ran = JS_ExecutePendingJob(g_rt, &job_ctx);
+            if (ran <= 0) break;
+            promise_state = JS_PromiseState(g_ctx, val);
+        }
+        if (promise_state == JS_PROMISE_FULFILLED || promise_state == JS_PROMISE_REJECTED) {
+            JSValue settled = JS_PromiseResult(g_ctx, val);
+            JS_FreeValue(g_ctx, val);
+            val = settled;
+            if (promise_state == JS_PROMISE_REJECTED) {
+                /* A rejected top-level Promise is reported the same way a
+                 * thrown exception is — that's what `await` would surface. */
+                const char *err_str = JS_ToCString(g_ctx, val);
+                if (err_str) {
+                    int len = (int)strlen(err_str);
+                    if (len > (int)sizeof(g_error) - 1) len = (int)sizeof(g_error) - 1;
+                    memcpy(g_error, err_str, len);
+                    g_error[len] = '\0';
+                    JS_FreeCString(g_ctx, err_str);
+                }
+                JS_FreeValue(g_ctx, val);
+                return -1;
+            }
+        }
+    }
+
     /* Convert result to string */
     if (JS_IsString(val)) {
         const char *s = JS_ToCString(g_ctx, val);
@@ -1141,6 +1179,63 @@ static const char *DOM_PRELUDE =
     "  if (!p) return;\n"
     "  __kk_pending_fetches.delete(id);\n"
     "  p.reject(new Error(message));\n"
+    "};\n"
+    /* Vanilla QuickJS (unlike quickjs-ng or a real browser) never links ICU
+     * and has no `Intl` global at all — any script that references it
+     * (feature-detection like `typeof Intl`, or an outright `new
+     * Intl.NumberFormat(...)` call, both common in analytics/maps/i18n
+     * snippets) hits a bare ReferenceError before it can do anything else.
+     * This is a pragmatic, locale-oblivious subset (always formats as if
+     * locale were 'en-US', no real ICU number/date/plural rules) — same
+     * spirit as the URL/URLSearchParams polyfills above: enough surface
+     * that real-world scripts stop crashing on first touch, not a spec-
+     * faithful implementation. */
+    "globalThis.Intl = {\n"
+    "  NumberFormat: class NumberFormat {\n"
+    "    constructor(locale, options) { this.options = options || {}; }\n"
+    "    format(value) {\n"
+    "      const n = Number(value);\n"
+    "      const opts = this.options;\n"
+    "      if (opts.style === 'percent') {\n"
+    "        return (n * 100).toFixed(opts.maximumFractionDigits ?? 0) + '%';\n"
+    "      }\n"
+    "      const defaultDigits = opts.style === 'currency' ? 2 : (Number.isInteger(n) ? 0 : 3);\n"
+    "      let digits = n.toFixed(opts.maximumFractionDigits ?? defaultDigits);\n"
+    "      let [intPart, fracPart] = digits.split('.');\n"
+    "      if (opts.useGrouping !== false) {\n"
+    "        intPart = intPart.replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',');\n"
+    "      }\n"
+    "      let out = fracPart ? intPart + '.' + fracPart : intPart;\n"
+    "      if (opts.style === 'currency') {\n"
+    "        out = (opts.currencyDisplay === 'code' ? (opts.currency || 'USD') + ' ' : '$') + out;\n"
+    "      }\n"
+    "      return out;\n"
+    "    }\n"
+    "    resolvedOptions() { return Object.assign({ locale: 'en-US', numberingSystem: 'latn' }, this.options); }\n"
+    "  },\n"
+    "  DateTimeFormat: class DateTimeFormat {\n"
+    "    constructor(locale, options) { this.options = options || {}; }\n"
+    "    format(date) {\n"
+    "      const d = date instanceof Date ? date : new Date(date);\n"
+    "      return d.toString();\n"
+    "    }\n"
+    "    resolvedOptions() { return Object.assign({ locale: 'en-US', timeZone: 'UTC' }, this.options); }\n"
+    "  },\n"
+    "  Collator: class Collator {\n"
+    "    constructor(locale, options) { this.options = options || {}; }\n"
+    "    compare(a, b) { a = String(a); b = String(b); return a < b ? -1 : a > b ? 1 : 0; }\n"
+    "  },\n"
+    "  PluralRules: class PluralRules {\n"
+    "    constructor(locale, options) { this.options = options || {}; }\n"
+    "    select(n) { return n === 1 ? 'one' : 'other'; }\n"
+    "  },\n"
+    "  ListFormat: class ListFormat {\n"
+    "    constructor(locale, options) { this.options = options || {}; }\n"
+    "    format(list) { return Array.from(list).join(', '); }\n"
+    "  },\n"
+    "  getCanonicalLocales(locales) {\n"
+    "    return locales === undefined ? [] : Array.isArray(locales) ? locales.slice() : [String(locales)];\n"
+    "  },\n"
     "};\n"
     "delete globalThis.__LPWNodeProto;\n";
 
