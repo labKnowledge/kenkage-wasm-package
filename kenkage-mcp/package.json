@@ -1,0 +1,45 @@
+{
+  "name": "kenkage-mcp",
+  "version": "0.1.0",
+  "description": "MCP server exposing kenkage's on-device, isolation-by-construction DOM+JS engine as agent tools: safely load/parse a page, query the DOM, and run untrusted JavaScript in a real WASM sandbox — no headless browser, no server round-trip.",
+  "type": "module",
+  "bin": {
+    "kenkage-mcp": "bin/kenkage-mcp.js"
+  },
+  "files": [
+    "bin",
+    "src"
+  ],
+  "scripts": {
+    "start": "node bin/kenkage-mcp.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "kenkage",
+    "agent",
+    "sandbox",
+    "wasm",
+    "dom",
+    "on-device"
+  ],
+  "author": "gakwaya <gakwayaremy@outlook.com>",
+  "license": "MIT",
+  "homepage": "https://github.com/labKnowledge/kenkage-wasm-package/tree/main/kenkage-mcp#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/labKnowledge/kenkage-wasm-package.git",
+    "directory": "kenkage-mcp"
+  },
+  "bugs": {
+    "url": "https://github.com/labKnowledge/kenkage-wasm-package/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "kenkage": "^0.2.0",
+    "zod": "^4.0.0"
+  }
+}

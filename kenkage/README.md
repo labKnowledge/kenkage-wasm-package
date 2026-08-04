@@ -146,6 +146,17 @@ export default async function Page() {
 }
 ```
 
+### MCP server (agent tools)
+
+[`kenkage-mcp`](../kenkage-mcp) exposes `loadPage()`, `parse()`, `querySelector()`,
+and `eval()` as Model Context Protocol tools, so an agent (Claude Code, Claude
+Desktop, or any MCP client) can safely load a page or run untrusted JS
+directly, isolated by construction:
+
+```sh
+claude mcp add kenkage -- npx -y kenkage-mcp
+```
+
 `createKenkagePage` loads the WASM module once via `fs.readFileSync` and
 reuses the instance across requests.
 
