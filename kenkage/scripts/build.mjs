@@ -37,6 +37,7 @@ const entries = [
   { in: join(SRC, 'index.ts'), out: 'index' },
   { in: join(SRC, 'react.tsx'), out: 'react' },
   { in: join(SRC, 'next.ts'), out: 'next' },
+  { in: join(SRC, 'bridge.ts'), out: 'bridge' },
 ];
 
 // Shared externals

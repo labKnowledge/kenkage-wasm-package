@@ -67,7 +67,10 @@ wherever the module runs.
 - **Two builds** — `core` (~650KB, HTML/DOM/CSS only) and `full` (adds
   QuickJS) — so callers that only need parsing don't pay for a JS engine.
 - **Runs anywhere** — browser, Node, or Next.js (client, server component,
-  or API route), via one package with three entry points.
+  or API route), via one package with four entry points.
+- **Optional network bridge** (`kenkage/bridge`) — a companion browser
+  extension gives `loadPage()`/`fetch()` real cross-origin access from a
+  browser tab, without a server, for the sites that don't send CORS headers.
 
 ## Install
 
@@ -145,6 +148,39 @@ export default async function Page() {
 
 `createKenkagePage` loads the WASM module once via `fs.readFileSync` and
 reuses the instance across requests.
+
+### Real network access from a browser tab (CORS)
+
+`loadPage()`/`fetch()` in a real browser tab are subject to the same
+same-origin policy any page's `fetch()` is — most third-party sites don't
+send `Access-Control-Allow-Origin`, so a plain in-page fetch to them fails
+with a CORS error. That's not a kenkage limitation; it's the browser
+working as designed, and no on-device JavaScript can opt out of it.
+
+The one sanctioned exception: browser extensions' background contexts are
+documented as exempt from page-level CORS. `kenkage/bridge`, paired with
+the companion extension in [`extension/`](extension), uses exactly that —
+nothing routes through a server, the request still goes straight from the
+browser, on the user's machine, to the URL asked for:
+
+```ts
+import { createKenkage } from 'kenkage';
+import { isBridgeAvailable, createBridgeFetch } from 'kenkage/bridge';
+
+const engine = await createKenkage({ engine: 'full' });
+await engine.init();
+
+const fetchFn = (await isBridgeAvailable()) ? createBridgeFetch() : undefined;
+const page = await engine.loadPage('https://example.com', { fetchFn });
+```
+
+`isBridgeAvailable()` resolves `false` quickly if the extension isn't
+installed, so this degrades to a plain (CORS-restricted) `fetch()`
+automatically — the extension is a strict opt-in upgrade, never a hard
+dependency. See [`extension/README.md`](extension/README.md) for what it
+does, its safety limits (private-network blocking, rate limiting, response
+caps), and the one thing it honestly can't fully defend against (DNS
+rebinding — documented there, not hidden).
 
 ### Bundler consumers
 
