@@ -92,6 +92,16 @@ export interface LoadPageResult {
   scriptsSkipped: { src?: string; reason: string }[];
   /** Scripts that ran but threw, or failed to fetch. */
   scriptErrors: { src?: string; message: string }[];
+  /**
+   * Exceptions thrown by event listeners (`addEventListener`) or timer
+   * callbacks (`setTimeout`/`requestAnimationFrame`/etc.) — these don't
+   * propagate to their caller in a real browser either (they'd surface as
+   * a `window.onerror` report), so they're collected here instead of being
+   * silently discarded. A page's post-load data-fetching very often lives
+   * inside exactly these callbacks, so a non-empty list here is frequently
+   * the actual reason expected content or API calls didn't happen.
+   */
+  uncaughtErrors: { type: string; message: string }[];
 }
 
 export interface KenkageOptions {
@@ -430,14 +440,33 @@ export async function createKenkage(
   }
 
   /**
+   * Reads and clears the sandbox's __kk_uncaught_errors sink — exceptions
+   * thrown by event listeners or timer callbacks, which (like a real
+   * browser) never propagate to whoever dispatched/scheduled them. See
+   * __kk_record_uncaught in the DOM prelude.
+   */
+  async function drainUncaughtErrors(): Promise<{ type: string; message: string }[]> {
+    const res = await api.eval('JSON.stringify(__kk_drain_uncaught_errors())');
+    if (!res.success) return [];
+    try {
+      return JSON.parse(res.result);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
    * Settles any pending sandboxed fetch(url) calls with real, host-fetched
    * responses. Scripts running via loadPage() can call fetch() like any
    * real page would — this is what actually performs the network request
    * on their behalf and wakes their Promise chain back up. Loops (bounded)
-   * since resolving one fetch's .then() can itself queue another.
+   * since resolving one fetch's .then() can itself queue another. Any
+   * listener/timer exceptions raised while settling a fetch's Promise chain
+   * are appended to `uncaughtErrors`.
    */
   async function drainPendingFetches(
     doFetch: (url: string) => Promise<{ status: number; body: string }>,
+    uncaughtErrors: { type: string; message: string }[],
   ): Promise<void> {
     for (let guard = 0; guard < 100; guard++) {
       const peek = await api.eval('JSON.stringify(__kk_next_fetch_request())');
@@ -460,6 +489,7 @@ export async function createKenkage(
         exports.kk_js_reject_fetch?.(req.id, EVAL_FETCH_OFFSET, msgLen);
       }
       exports.kk_js_run_pending_jobs?.();
+      uncaughtErrors.push(...(await drainUncaughtErrors()));
     }
   }
 
@@ -844,10 +874,26 @@ export async function createKenkage(
       const { status, body } = await doFetch(url);
       api.parse(body);
 
+      // Seed location/history from the real page URL — kk_js_reset() just
+      // re-ran the DOM prelude, which can only set a neutral 'about:blank'
+      // default since it has no access to loadPage()'s url argument. A lot
+      // of real app code computes its own API base URL from
+      // window.location (e.g. `fetch(location.origin + '/api/...')`), so
+      // leaving this at the default would silently point those calls at
+      // the wrong place even once they do execute.
+      await api.eval(`(function () {
+        const u = new URL(${JSON.stringify(url)});
+        Object.assign(globalThis.location, {
+          href: u.href, protocol: u.protocol, host: u.host, hostname: u.hostname,
+          port: u.port, pathname: u.pathname, search: u.search, hash: u.hash, origin: u.origin,
+        });
+      })();`);
+
       const scriptIds = api.querySelector('script');
       let scriptsExecuted = 0;
       const scriptsSkipped: { src?: string; reason: string }[] = [];
       const scriptErrors: { src?: string; message: string }[] = [];
+      const uncaughtErrors: { type: string; message: string }[] = [];
       // Import-graph dedup set shared across every module script on the
       // page so common dependencies are only fetched once. See
       // crawlModuleGraph above. (The module source table itself was
@@ -911,9 +957,10 @@ export async function createKenkage(
           scriptErrors.push({ src, message: result.result });
         }
         scriptsExecuted++;
+        uncaughtErrors.push(...(await drainUncaughtErrors()));
         // A script's own top-level fetch() calls (or ones queued by its
         // synchronous execution) get their real network round-trip here.
-        await drainPendingFetches(doFetch);
+        await drainPendingFetches(doFetch, uncaughtErrors);
       }
 
       // Real pages hang a lot of setup off these — run any handlers scripts
@@ -925,7 +972,8 @@ export async function createKenkage(
       await api.eval(
         "document.dispatchEvent('DOMContentLoaded'); document.dispatchEvent('load'); window.dispatchEvent('load');"
       );
-      await drainPendingFetches(doFetch);
+      uncaughtErrors.push(...(await drainUncaughtErrors()));
+      await drainPendingFetches(doFetch, uncaughtErrors);
 
       return {
         status,
@@ -935,6 +983,7 @@ export async function createKenkage(
         scriptsExecuted,
         scriptsSkipped,
         scriptErrors,
+        uncaughtErrors,
       };
     },
   };
