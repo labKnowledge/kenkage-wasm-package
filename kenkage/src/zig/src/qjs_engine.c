@@ -88,6 +88,10 @@ static int double_to_str(char *buf, int bufsize, double val) {
 
 static void setup_dom_bindings(JSContext *ctx);
 
+static void kk_clear_modules(void);
+static JSModuleDef *kk_module_loader(JSContext *ctx, const char *module_name, void *opaque);
+static char *kk_module_normalize(JSContext *ctx, const char *base_name, const char *name, void *opaque);
+
 int qjs_init(void) {
     g_rt = JS_NewRuntime();
     if (!g_rt) return 0;
@@ -98,11 +102,15 @@ int qjs_init(void) {
         return 0;
     }
     setup_dom_bindings(g_ctx);
+    /* Registered after the DOM prelude so kk_module_normalize's `URL` lookup
+     * (used only when a module is actually loaded, i.e. after init has
+     * fully completed) always finds the polyfill in place. */
+    JS_SetModuleLoaderFunc(g_rt, kk_module_normalize, kk_module_loader, NULL);
     return 1;
 }
 
 void qjs_destroy(void) {
-    if (g_ctx) { JS_FreeContext(g_ctx); g_ctx = NULL; }
+    if (g_ctx) { kk_clear_modules(); JS_FreeContext(g_ctx); g_ctx = NULL; }
     if (g_rt) { JS_FreeRuntime(g_rt); g_rt = NULL; }
 }
 
@@ -199,6 +207,198 @@ int qjs_get_global(const char *name) {
         }
     }
     JS_FreeValue(g_ctx, val);
+    return 0;
+}
+
+/* ============================================================
+ * ES MODULE SUPPORT
+ * ============================================================
+ * QuickJS's module loader callback (JSModuleLoaderFunc) is synchronous —
+ * unlike fetch() below, which suspends behind a real Promise while the
+ * host performs a network round-trip, the loader cannot itself await
+ * anything crossing back out to the host. So the entire static import
+ * graph must be pre-fetched and registered here via qjs_register_module()
+ * *before* qjs_eval_module() runs; the loader only ever does a synchronous
+ * lookup in this table. (Dynamic `import()` doesn't have this constraint
+ * since it's Promise-based already, but isn't wired up yet — out of scope
+ * for this pass.)
+ */
+#define KK_MAX_MODULES 256
+static char *g_module_urls[KK_MAX_MODULES];
+static char *g_module_srcs[KK_MAX_MODULES];
+static int g_module_count = 0;
+
+static void kk_clear_modules(void) {
+    for (int i = 0; i < g_module_count; i++) {
+        if (g_module_urls[i]) js_free(g_ctx, g_module_urls[i]);
+        if (g_module_srcs[i]) js_free(g_ctx, g_module_srcs[i]);
+        g_module_urls[i] = NULL;
+        g_module_srcs[i] = NULL;
+    }
+    g_module_count = 0;
+}
+
+/* Called by the host at the start of every fresh loadPage() crawl so a
+ * previous page's modules can't leak into (or collide with) the next. */
+void qjs_clear_modules(void) {
+    if (!g_ctx) return;
+    kk_clear_modules();
+}
+
+/* Registers pre-fetched source for a resolved module URL (last write wins
+ * for a repeated url, so re-registering mid-crawl is harmless). */
+int qjs_register_module(const char *url, int url_len, const char *src, int src_len) {
+    if (!g_ctx) return -2;
+    for (int i = 0; i < g_module_count; i++) {
+        if ((int)strlen(g_module_urls[i]) == url_len && memcmp(g_module_urls[i], url, url_len) == 0) {
+            char *src_copy = js_malloc(g_ctx, (size_t)src_len + 1);
+            if (!src_copy) return -2;
+            memcpy(src_copy, src, src_len);
+            src_copy[src_len] = '\0';
+            js_free(g_ctx, g_module_srcs[i]);
+            g_module_srcs[i] = src_copy;
+            return 0;
+        }
+    }
+    if (g_module_count >= KK_MAX_MODULES) return -3;
+    char *url_copy = js_malloc(g_ctx, (size_t)url_len + 1);
+    char *src_copy = js_malloc(g_ctx, (size_t)src_len + 1);
+    if (!url_copy || !src_copy) {
+        if (url_copy) js_free(g_ctx, url_copy);
+        if (src_copy) js_free(g_ctx, src_copy);
+        return -2;
+    }
+    memcpy(url_copy, url, url_len); url_copy[url_len] = '\0';
+    memcpy(src_copy, src, src_len); src_copy[src_len] = '\0';
+    g_module_urls[g_module_count] = url_copy;
+    g_module_srcs[g_module_count] = src_copy;
+    g_module_count++;
+    return 0;
+}
+
+/* Minimal import.meta — just `url` and `main`, no realpath/file: URL
+ * dance (module names here are always already-absolute http(s) URLs
+ * supplied by the host, unlike quickjs's own CLI which loads from disk). */
+static void kk_set_import_meta(JSContext *ctx, JSValueConst func_val, int is_main) {
+    if (JS_VALUE_GET_TAG(func_val) != JS_TAG_MODULE) return;
+    JSModuleDef *m = JS_VALUE_GET_PTR(func_val);
+    JSAtom name_atom = JS_GetModuleName(ctx, m);
+    const char *name = JS_AtomToCString(ctx, name_atom);
+    JS_FreeAtom(ctx, name_atom);
+    JSValue meta_obj = JS_GetImportMeta(ctx, m);
+    if (!JS_IsException(meta_obj)) {
+        JS_DefinePropertyValueStr(ctx, meta_obj, "url", JS_NewString(ctx, name ? name : ""), JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, meta_obj, "main", JS_NewBool(ctx, is_main), JS_PROP_C_W_E);
+        JS_FreeValue(ctx, meta_obj);
+    } else {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    if (name) JS_FreeCString(ctx, name);
+}
+
+/* Resolves a specifier against the importing module's URL using the
+ * sandbox's own URL polyfill (already loaded by the DOM prelude) instead
+ * of re-implementing URL joining in C. Falls back to the raw specifier on
+ * failure (e.g. a bare specifier with no import map) so the loader below
+ * reports a clean "module not found" instead of this crashing. */
+static char *kk_module_normalize(JSContext *ctx, const char *base_name, const char *name, void *opaque) {
+    (void)opaque;
+    JSValue global = JS_GetGlobalObject(ctx);
+    JS_SetPropertyStr(ctx, global, "__kk_norm_name", JS_NewString(ctx, name));
+    JS_SetPropertyStr(ctx, global, "__kk_norm_base", base_name ? JS_NewString(ctx, base_name) : JS_UNDEFINED);
+    JS_FreeValue(ctx, global);
+
+    static const char norm_code[] =
+        "(function(){"
+        "  try { return new URL(__kk_norm_name, __kk_norm_base).href; }"
+        "  catch (e) { return __kk_norm_name; }"
+        "})()";
+    JSValue result = JS_Eval(ctx, norm_code, strlen(norm_code), "<module-normalize>", JS_EVAL_TYPE_GLOBAL);
+    char *out = NULL;
+    if (!JS_IsException(result)) {
+        const char *s = JS_ToCString(ctx, result);
+        if (s) {
+            size_t len = strlen(s);
+            out = js_malloc(ctx, len + 1);
+            if (out) memcpy(out, s, len + 1);
+            JS_FreeCString(ctx, s);
+        }
+    } else {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    JS_FreeValue(ctx, result);
+    return out;
+}
+
+/* The loader never does I/O itself — every specifier it's asked for must
+ * already have been fetched and registered via qjs_register_module()
+ * during the host's pre-crawl. Anything missing (a bare specifier with no
+ * import map, a dynamic import the crawler couldn't see statically)
+ * surfaces as a real ReferenceError instead of silently failing. */
+static JSModuleDef *kk_module_loader(JSContext *ctx, const char *module_name, void *opaque) {
+    (void)opaque;
+    for (int i = 0; i < g_module_count; i++) {
+        if (strcmp(g_module_urls[i], module_name) == 0) {
+            const char *src = g_module_srcs[i];
+            JSValue func_val = JS_Eval(ctx, src, strlen(src), module_name,
+                                       JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+            if (JS_IsException(func_val)) return NULL;
+            kk_set_import_meta(ctx, func_val, 0);
+            JSModuleDef *m = JS_VALUE_GET_PTR(func_val);
+            JS_FreeValue(ctx, func_val);
+            return m;
+        }
+    }
+    JS_ThrowReferenceError(ctx, "could not resolve module '%s' (not pre-fetched)", module_name);
+    return NULL;
+}
+
+/* Evaluates `code` (already fetched by the host) as an ES module whose
+ * resolved name is `url` — mirrors quickjs's own CLI eval_buf() for
+ * modules: compile-only first so import.meta can be set on it, then run. */
+int qjs_eval_module(const char *url, int url_len, const char *code, int code_len) {
+    if (!g_ctx) return -2;
+    g_result[0] = '\0';
+    g_error[0] = '\0';
+
+    char name_buf[2048];
+    int n = url_len < (int)sizeof(name_buf) - 1 ? url_len : (int)sizeof(name_buf) - 1;
+    memcpy(name_buf, url, n);
+    name_buf[n] = '\0';
+
+    JSValue func_val = JS_Eval(g_ctx, code, (size_t)code_len, name_buf,
+                               JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (JS_IsException(func_val)) {
+        JSValue exc_val = JS_GetException(g_ctx);
+        const char *err_str = JS_ToCString(g_ctx, exc_val);
+        if (err_str) {
+            int len = (int)strlen(err_str);
+            if (len > (int)sizeof(g_error) - 1) len = (int)sizeof(g_error) - 1;
+            memcpy(g_error, err_str, len);
+            g_error[len] = '\0';
+            JS_FreeCString(g_ctx, err_str);
+        }
+        JS_FreeValue(g_ctx, exc_val);
+        return -1;
+    }
+
+    kk_set_import_meta(g_ctx, func_val, 1);
+    JSValue result = JS_EvalFunction(g_ctx, func_val); /* consumes func_val */
+    if (JS_IsException(result)) {
+        JSValue exc_val = JS_GetException(g_ctx);
+        const char *err_str = JS_ToCString(g_ctx, exc_val);
+        if (err_str) {
+            int len = (int)strlen(err_str);
+            if (len > (int)sizeof(g_error) - 1) len = (int)sizeof(g_error) - 1;
+            memcpy(g_error, err_str, len);
+            g_error[len] = '\0';
+            JS_FreeCString(g_ctx, err_str);
+        }
+        JS_FreeValue(g_ctx, exc_val);
+        JS_FreeValue(g_ctx, result);
+        return -1;
+    }
+    JS_FreeValue(g_ctx, result);
     return 0;
 }
 
@@ -688,6 +888,25 @@ static const char *DOM_PRELUDE =
     "  toString() { return this.__entries.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&'); }\n"
     "  [Symbol.iterator]() { return this.__entries[Symbol.iterator](); }\n"
     "};\n"
+    /* Collapses '.'/'..' path segments (RFC 3986 §5.2.4-style), e.g.
+     * '/a/./b/../c' -> '/a/c'. Without this, a relative specifier like
+     * './helper.js' resolves to '.../​./helper.js' (the literal dot
+     * segment left in place) instead of '.../helper.js' — harmless for
+     * display, but a real bug for anything that treats the resolved URL
+     * as an exact lookup key (module resolution does exactly that: see
+     * kk_module_normalize in qjs_engine.c, which relies on this class). */
+    "function __kk_normalize_url_path(path) {\n"
+    "  const isAbsolute = path.startsWith('/');\n"
+    "  const out = [];\n"
+    "  for (const part of path.split('/')) {\n"
+    "    if (part === '.' || part === '') continue;\n"
+    "    if (part === '..') { out.pop(); continue; }\n"
+    "    out.push(part);\n"
+    "  }\n"
+    "  let result = out.join('/');\n"
+    "  if (path.endsWith('/') && !result.endsWith('/')) result += '/';\n"
+    "  return (isAbsolute ? '/' : '') + result || '/';\n"
+    "}\n"
     "globalThis.URL = class URL {\n"
     "  constructor(url, base) {\n"
     "    let full = String(url);\n"
@@ -707,11 +926,11 @@ static const char *DOM_PRELUDE =
     "    this.host = m[2] || '';\n"
     "    this.hostname = m[3] || '';\n"
     "    this.port = m[5] || '';\n"
-    "    this.pathname = m[6] || '/';\n"
+    "    this.pathname = __kk_normalize_url_path(m[6] || '/');\n"
     "    this.search = m[7] || '';\n"
     "    this.hash = m[8] || '';\n"
     "    this.origin = this.protocol + '//' + this.host;\n"
-    "    this.href = full;\n"
+    "    this.href = this.protocol + '//' + this.host + this.pathname + this.search + this.hash;\n"
     "    this.searchParams = new URLSearchParams(this.search);\n"
     "  }\n"
     "  toString() { return this.href; }\n"

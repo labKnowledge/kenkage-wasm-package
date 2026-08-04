@@ -101,6 +101,9 @@ extern fn qjs_last_result_type() c_int;
 extern fn qjs_run_pending_jobs() c_int;
 extern fn qjs_resolve_fetch(id: u32, status: u32, body: [*]const u8, body_len: u32) c_int;
 extern fn qjs_reject_fetch(id: u32, msg: [*]const u8, msg_len: u32) c_int;
+extern fn qjs_clear_modules() void;
+extern fn qjs_register_module(url: [*]const u8, url_len: c_int, src: [*]const u8, src_len: c_int) c_int;
+extern fn qjs_eval_module(url: [*]const u8, url_len: c_int, code: [*]const u8, code_len: c_int) c_int;
 
 // ============================================================
 //  HELPERS
@@ -949,6 +952,27 @@ export fn kk_js_destroy() void {
 
 export fn kk_js_eval(code_ptr: [*]const u8, code_len: u32) c_int {
     return qjs_eval(code_ptr, @intCast(code_len));
+}
+
+/// Clears the pre-fetched module-source table. Called once at the start
+/// of each loadPage() so a previous page's modules can't leak into (or
+/// collide with) the next one run on the same engine instance.
+export fn kk_js_clear_modules() void {
+    qjs_clear_modules();
+}
+
+/// Registers pre-fetched source for a resolved module URL — must be called
+/// for the entry module and every statically-discovered dependency before
+/// kk_js_eval_module(), since the module loader itself cannot do I/O.
+export fn kk_js_register_module(url_ptr: [*]const u8, url_len: u32, src_ptr: [*]const u8, src_len: u32) c_int {
+    return qjs_register_module(url_ptr, @intCast(url_len), src_ptr, @intCast(src_len));
+}
+
+/// Evaluates `code` as an ES module resolved as `url`. Any static imports
+/// it (or its dependencies) contain must already be registered via
+/// kk_js_register_module().
+export fn kk_js_eval_module(url_ptr: [*]const u8, url_len: u32, code_ptr: [*]const u8, code_len: u32) c_int {
+    return qjs_eval_module(url_ptr, @intCast(url_len), code_ptr, @intCast(code_len));
 }
 
 export fn kk_js_get_result() [*]const u8 {

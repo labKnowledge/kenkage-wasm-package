@@ -42,17 +42,24 @@ export interface KenkageWasm {
   fetch(url: string, options?: { method?: string; headers?: Record<string, string>; body?: string }): Promise<{ status: number; body: string }>;
   /**
    * Loads a page like a browser tab would: fetches `url`, parses it, then
-   * runs every classic (non-module) `<script>` found — external ones are
-   * fetched and executed in document order, inline ones run directly —
-   * against the real DOM via the 'full' engine's document/Element
-   * bindings. Draining Promise microtasks and the setTimeout queue happens
-   * automatically after each script. Requires `engine: 'full'`.
+   * runs every `<script>` found in document order — external ones are
+   * fetched, inline ones run directly — against the real DOM via the
+   * 'full' engine's document/Element bindings. Draining Promise microtasks
+   * and the setTimeout queue happens automatically after each script.
+   * Requires `engine: 'full'`.
    *
    * Only available with `engine: 'full'` — the 'core' build has no JS
    * engine to run scripts on, so this throws if called on it.
    *
-   * `<script type="module">` is not executed (no ES module loader yet) and
-   * is reported in `scriptsSkipped` instead of silently vanishing.
+   * `<script type="module">` is executed as a real ES module: static
+   * `import`/`export` specifiers are crawled and pre-fetched (recursively,
+   * deduped across the page) before evaluation, since QuickJS's module
+   * loader is synchronous and can't itself await a network round-trip.
+   * Specifiers a static crawl can't see — bare specifiers with no import
+   * map, or ones behind computed/dynamic `import(...)` — surface as a
+   * ReferenceError in `scriptErrors` rather than being resolved. Only
+   * `<script type="importmap">` and other non-executable types still land
+   * in `scriptsSkipped`.
    */
   loadPage(url: string, options?: LoadPageOptions): Promise<LoadPageResult>;
   /** Engine version string (available before init). */
@@ -78,7 +85,7 @@ export interface LoadPageResult {
   text: string;
   /** How many `<script>` elements actually ran. */
   scriptsExecuted: number;
-  /** Scripts not run — e.g. `type="module"`, unresolvable `src`. */
+  /** Scripts not run — e.g. `type="importmap"`, unresolvable `src`. */
   scriptsSkipped: { src?: string; reason: string }[];
   /** Scripts that ran but threw, or failed to fetch. */
   scriptErrors: { src?: string; message: string }[];
@@ -145,6 +152,9 @@ interface WasmExports {
   kk_js_run_pending_jobs?: () => number;
   kk_js_resolve_fetch?: (id: number, status: number, bodyPtr: number, bodyLen: number) => number;
   kk_js_reject_fetch?: (id: number, msgPtr: number, msgLen: number) => number;
+  kk_js_clear_modules?: () => void;
+  kk_js_register_module?: (urlPtr: number, urlLen: number, srcPtr: number, srcLen: number) => number;
+  kk_js_eval_module?: (urlPtr: number, urlLen: number, codePtr: number, codeLen: number) => number;
 }
 
 // ── Constants ─────────────────────────────────────────────────────
@@ -449,6 +459,117 @@ export async function createKenkage(
     }
   }
 
+  /**
+   * Extracts static import specifiers from ES module source. Deliberately
+   * simple regex matching rather than full lexing/parsing — covers
+   * `import ... from "spec"`, `export ... from "spec"`, and bare
+   * `import "spec"`, which is what real-world bundler output overwhelmingly
+   * uses. Misses specifiers hidden behind computed values or dynamic
+   * `import(...)` calls — a known, documented limitation (see
+   * crawlModuleGraph below).
+   */
+  function extractImportSpecifiers(code: string): string[] {
+    const specifiers = new Set<string>();
+    const fromRe = /\bfrom\s*['"]([^'"]+)['"]/g;
+    const bareImportRe = /\bimport\s*['"]([^'"]+)['"]/g;
+    let m: RegExpExecArray | null;
+    while ((m = fromRe.exec(code))) specifiers.add(m[1]);
+    while ((m = bareImportRe.exec(code))) specifiers.add(m[1]);
+    return [...specifiers];
+  }
+
+  /** Writes two strings back-to-back starting at `baseOffset`, growing WASM
+   * memory as needed (via writeStringAt) for each. Used wherever the C side
+   * needs a (ptr, len) pair for two strings simultaneously present. */
+  function writeTwoStringsAt(
+    a: string,
+    b: string,
+    baseOffset: number,
+  ): { aOffset: number; aLen: number; bOffset: number; bLen: number } {
+    const aLen = writeStringAt(a, baseOffset);
+    const bOffset = baseOffset + aLen;
+    const bLen = writeStringAt(b, bOffset);
+    return { aOffset: baseOffset, aLen, bOffset, bLen };
+  }
+
+  /** Registers pre-fetched source for a resolved module URL in the WASM
+   * module table, so QuickJS's (synchronous) module loader can find it. */
+  function registerModule(moduleUrl: string, code: string): void {
+    if (!exports.kk_js_register_module) return;
+    const { aLen: urlLen, bOffset: codeOffset, bLen: codeLen } = writeTwoStringsAt(
+      moduleUrl,
+      code,
+      EVAL_FETCH_OFFSET,
+    );
+    exports.kk_js_register_module(EVAL_FETCH_OFFSET, urlLen, codeOffset, codeLen);
+  }
+
+  /** Evaluates `code` as an ES module resolved as `moduleUrl` — the
+   * module-aware counterpart to api.eval() used for `<script type="module">`. */
+  async function evalModule(moduleUrl: string, code: string): Promise<{ success: boolean; result: string }> {
+    ensureJsEngine();
+    const { aLen: urlLen, bOffset: codeOffset, bLen: codeLen } = writeTwoStringsAt(
+      moduleUrl,
+      code,
+      EVAL_FETCH_OFFSET,
+    );
+    const rc = exports.kk_js_eval_module!(EVAL_FETCH_OFFSET, urlLen, codeOffset, codeLen);
+    exports.kk_js_run_pending_jobs?.();
+    const mem = new Uint8Array(exports.memory.buffer);
+    if (rc === 0) {
+      const ptr = exports.kk_js_get_result!();
+      const len = exports.kk_js_get_result_len!();
+      return { success: true, result: decoder.decode(mem.slice(ptr, ptr + len)) };
+    }
+    const ptr = exports.kk_js_get_error!();
+    const len = exports.kk_js_get_error_len!();
+    return { success: false, result: decoder.decode(mem.slice(ptr, ptr + len)) };
+  }
+
+  /**
+   * Crawls a module's static import graph — fetching and registering every
+   * dependency it (transitively) statically imports — before evaluation.
+   * QuickJS's module loader callback is synchronous: it can't itself
+   * suspend behind a Promise the way fetch() does via drainPendingFetches,
+   * so the whole graph must be fetched and registered up front. `visited`
+   * is shared across every `<script type="module">` on a page, so common
+   * dependencies (shared chunks, vendor bundles) are only fetched once.
+   *
+   * Specifiers that fail to resolve (bare specifiers with no import map)
+   * are left alone — evalModule()/the loader will surface a clear
+   * ReferenceError for them rather than this throwing here.
+   */
+  async function crawlModuleGraph(
+    entryUrl: string,
+    entryCode: string,
+    doFetch: (url: string) => Promise<{ status: number; body: string }>,
+    visited: Set<string>,
+    errors: { src?: string; message: string }[],
+  ): Promise<void> {
+    visited.add(entryUrl);
+    const queue: { url: string; code: string }[] = [{ url: entryUrl, code: entryCode }];
+    while (queue.length > 0) {
+      const { url: fromUrl, code } = queue.shift()!;
+      for (const spec of extractImportSpecifiers(code)) {
+        let resolved: string;
+        try {
+          resolved = new URL(spec, fromUrl).toString();
+        } catch {
+          continue;
+        }
+        if (visited.has(resolved)) continue;
+        visited.add(resolved);
+        try {
+          const res = await doFetch(resolved);
+          registerModule(resolved, res.body);
+          queue.push({ url: resolved, code: res.body });
+        } catch (err) {
+          errors.push({ src: resolved, message: err instanceof Error ? err.message : String(err) });
+        }
+      }
+    }
+  }
+
   function readStringFromResult(getPtr: () => number, getLen: () => number, cacheKey: string): string {
     const ptr = getPtr();
     const len = getLen();
@@ -692,18 +813,25 @@ export async function createKenkage(
       let scriptsExecuted = 0;
       const scriptsSkipped: { src?: string; reason: string }[] = [];
       const scriptErrors: { src?: string; message: string }[] = [];
+      // Fresh module table for this page load, and one import-graph
+      // dedup set shared across every module script on the page so common
+      // dependencies are only fetched once. See crawlModuleGraph above.
+      exports.kk_js_clear_modules?.();
+      const moduleVisited = new Set<string>();
 
       for (const id of scriptIds) {
         const type = api.nodeAttr(id, 'type').trim().toLowerCase();
         const src = api.nodeAttr(id, 'src') || undefined;
-        if (type && type !== 'text/javascript' && type !== 'application/javascript' && type !== 'application/ecmascript') {
-          // module, importmap, application/json data islands, etc. —
-          // not executable as classic script (no ES module loader yet).
+        const isModule = type === 'module';
+        if (type && !isModule && type !== 'text/javascript' && type !== 'application/javascript' && type !== 'application/ecmascript') {
+          // importmap, application/json data islands, etc. — not
+          // executable as classic or module script.
           scriptsSkipped.push({ src, reason: `unsupported script type "${type}"` });
           continue;
         }
 
         let code: string;
+        let moduleUrl: string | undefined;
         if (src) {
           let absoluteSrc: string;
           try {
@@ -719,17 +847,30 @@ export async function createKenkage(
             scriptErrors.push({ src: absoluteSrc, message: err instanceof Error ? err.message : String(err) });
             continue;
           }
+          moduleUrl = absoluteSrc;
         } else {
           const children = api.nodeChildren(id);
           code = children.length > 0 ? api.nodeText(children[0]) : '';
           if (!code.trim()) continue;
+          // Inline module scripts have no URL of their own — relative
+          // imports inside them resolve against the page's own URL, same
+          // as a real browser's document base URL. The fragment keeps
+          // each inline module's resolved name unique for import.meta.url
+          // and module-table keying.
+          if (isModule) moduleUrl = `${url}#inline-module-${id}`;
         }
 
         // Real bundlers commonly read document.currentScript to resolve
         // their own chunk's URL — set it for the duration of this script,
         // matching what a real browser does during synchronous execution.
         await api.eval(`document.currentScript = __kk_wrap_node(${id});`);
-        const result = await api.eval(code);
+        let result: { success: boolean; result: string };
+        if (isModule) {
+          await crawlModuleGraph(moduleUrl!, code, doFetch, moduleVisited, scriptErrors);
+          result = await evalModule(moduleUrl!, code);
+        } else {
+          result = await api.eval(code);
+        }
         await api.eval('document.currentScript = null;');
         if (!result.success) {
           scriptErrors.push({ src, message: result.result });
