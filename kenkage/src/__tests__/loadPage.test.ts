@@ -265,4 +265,101 @@ describe('loadPage — dynamic import()', () => {
     expect(result.scriptErrors).toEqual([]);
     expect(result.html).toContain('data-outcome="rejected"');
   });
+
+  it('resolves a computed dynamic import specifier on demand when the target genuinely exists', async () => {
+    // Same shape as the rejection test above, but the mock DOES have the
+    // computed target this time — proving the on-demand path (rewriteDynamicImports
+    // + __kk_dynamic_import + drainPendingModuleRequests) actually completes
+    // successfully end-to-end, not just fails gracefully.
+    const html = `<html><body>
+      <script type="module">
+        const name = 'home';
+        const mod = await import(\`./pages/\${name}.js\`);
+        document.body.setAttribute('data-page', mod.render());
+      </script>
+    </body></html>`;
+    const homeJs = `export function render() { return 'home-rendered'; }`;
+    const { fetchFn, calls } = makeFetchMock({
+      'https://example.com/': html,
+      'https://example.com/pages/home.js': homeJs,
+    });
+
+    const result = await engine.loadPage('https://example.com/', { fetchFn });
+
+    expect(result.scriptErrors).toEqual([]);
+    expect(result.uncaughtErrors).toEqual([]);
+    expect(result.html).toContain('data-page="home-rendered"');
+    expect(calls['https://example.com/pages/home.js']).toBe(1);
+  });
+
+  it('resolves a dynamic import triggered via eval() after loadPage() has already returned', async () => {
+    // The "lazy loading after page loading" case: nothing in the initial
+    // page ever imports pages/late.js — it's only requested by a
+    // completely separate eval() call made once loadPage() has already
+    // settled and returned, simulating a later click handler or
+    // navigation. This only works because activeDoFetch/activeModuleVisited
+    // persist on the engine instance beyond a single loadPage() call.
+    const html = `<html><body></body></html>`;
+    const lateJs = `export function render() { return 'late-rendered'; }`;
+    const { fetchFn, calls } = makeFetchMock({
+      'https://example.com/': html,
+      'https://example.com/pages/late.js': lateJs,
+    });
+
+    const loadResult = await engine.loadPage('https://example.com/', { fetchFn });
+    expect(loadResult.scriptErrors).toEqual([]);
+    expect(calls['https://example.com/pages/late.js']).toBeUndefined();
+
+    // eval()'s own return value reflects the top-level expression's state
+    // at the point evalRaw finishes — a pending Promise still waiting on a
+    // host-serviced dynamic import hasn't settled yet at that instant (the
+    // servicing happens in eval()'s *subsequent* drain step), so this
+    // follows the same side-effect-then-reread idiom the loadPage() tests
+    // above use via document.body/result.html, rather than relying on the
+    // async IIFE's return value being captured directly.
+    const evalResult = await engine.eval(`(async () => {
+      const mod = await import('./pages/late.js');
+      globalThis.__testLateResult = mod.render();
+    })()`);
+    expect(evalResult.uncaughtErrors).toEqual([]);
+    expect(calls['https://example.com/pages/late.js']).toBe(1);
+
+    const readResult = await engine.eval('globalThis.__testLateResult');
+    expect(readResult.result).toBe('late-rendered');
+  });
+
+  it('settles a fetch->dynamic-import->fetch ping-pong chain, not just one pass of each', async () => {
+    // Mirrors the real-world pattern this was built for: a fetch's .then()
+    // triggers a dynamic import, and THAT module's own top-level code makes
+    // a second fetch — e.g. a feature-flag client's init fetch resolving,
+    // then lazily importing the component it gates, which itself fetches
+    // its own data. A single drainPendingFetches-then-drainPendingModuleRequests
+    // pass (the old behavior) would settle the first fetch and the import,
+    // but never revisit the fetch queue for the second one.
+    const html = `<html><body>
+      <script type="module">
+        const configRes = await fetch('/config.json');
+        const config = await configRes.json();
+        const mod = await import('./pages/' + config.page + '.js');
+        const dataRes = await mod.fetchData();
+        document.body.setAttribute('data-final', dataRes);
+      </script>
+    </body></html>`;
+    const pageJs = `export async function fetchData() {
+      const res = await fetch('/data.json');
+      return await res.text();
+    }`;
+    const { fetchFn } = makeFetchMock({
+      'https://example.com/': html,
+      'https://example.com/config.json': JSON.stringify({ page: 'ping' }),
+      'https://example.com/pages/ping.js': pageJs,
+      'https://example.com/data.json': 'pong-data',
+    });
+
+    const result = await engine.loadPage('https://example.com/', { fetchFn });
+
+    expect(result.scriptErrors).toEqual([]);
+    expect(result.uncaughtErrors).toEqual([]);
+    expect(result.html).toContain('data-final="pong-data"');
+  });
 });

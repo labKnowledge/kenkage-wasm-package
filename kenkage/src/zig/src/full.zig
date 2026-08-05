@@ -134,6 +134,119 @@ fn dupMut(allocator: std.mem.Allocator, s: []const u8) []u8 {
     return allocator.dupe(u8, s) catch @constCast(s);
 }
 
+/// Kept in sync with the identically-named function in core.zig — this
+/// file has its own independent copy of the HTML parser (see parseAttrs
+/// below) rather than sharing core.zig's, so the entity-decoding fix has
+/// to be applied here too. See core.zig's decodeEntities for the full
+/// rationale (in short: attribute values were stored as raw undecoded
+/// bytes, silently corrupting JSON-in-an-attribute patterns like
+/// `data-page="{&quot;...&quot;}"` that server-rendered frameworks — e.g.
+/// Inertia.js — use to hand off initial page state to the client).
+fn encodeUtf8(cp: u32, buf: *[4]u8) usize {
+    if (cp < 0x80) {
+        buf[0] = @intCast(cp);
+        return 1;
+    } else if (cp < 0x800) {
+        buf[0] = 0xC0 | @as(u8, @intCast(cp >> 6));
+        buf[1] = 0x80 | @as(u8, @intCast(cp & 0x3F));
+        return 2;
+    } else if (cp < 0x10000) {
+        buf[0] = 0xE0 | @as(u8, @intCast(cp >> 12));
+        buf[1] = 0x80 | @as(u8, @intCast((cp >> 6) & 0x3F));
+        buf[2] = 0x80 | @as(u8, @intCast(cp & 0x3F));
+        return 3;
+    } else {
+        buf[0] = 0xF0 | @as(u8, @intCast(cp >> 18));
+        buf[1] = 0x80 | @as(u8, @intCast((cp >> 12) & 0x3F));
+        buf[2] = 0x80 | @as(u8, @intCast((cp >> 6) & 0x3F));
+        buf[3] = 0x80 | @as(u8, @intCast(cp & 0x3F));
+        return 4;
+    }
+}
+
+fn decodeEntities(s: []const u8, allocator: std.mem.Allocator) []const u8 {
+    if (std.mem.indexOfScalar(u8, s, '&') == null) return dup(allocator, s);
+    const buf = allocator.alloc(u8, s.len) catch return dup(allocator, s);
+    var out_len: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '&') {
+            if (std.mem.startsWith(u8, s[i..], "&quot;")) {
+                buf[out_len] = '"';
+                out_len += 1;
+                i += 6;
+                continue;
+            }
+            if (std.mem.startsWith(u8, s[i..], "&apos;")) {
+                buf[out_len] = '\'';
+                out_len += 1;
+                i += 6;
+                continue;
+            }
+            if (std.mem.startsWith(u8, s[i..], "&lt;")) {
+                buf[out_len] = '<';
+                out_len += 1;
+                i += 4;
+                continue;
+            }
+            if (std.mem.startsWith(u8, s[i..], "&gt;")) {
+                buf[out_len] = '>';
+                out_len += 1;
+                i += 4;
+                continue;
+            }
+            if (std.mem.startsWith(u8, s[i..], "&nbsp;")) {
+                buf[out_len] = ' ';
+                out_len += 1;
+                i += 6;
+                continue;
+            }
+            if (std.mem.startsWith(u8, s[i..], "&amp;")) {
+                buf[out_len] = '&';
+                out_len += 1;
+                i += 5;
+                continue;
+            }
+            if (i + 2 < s.len and s[i + 1] == '#') {
+                var j = i + 2;
+                var hex = false;
+                if (j < s.len and (s[j] == 'x' or s[j] == 'X')) {
+                    hex = true;
+                    j += 1;
+                }
+                const digits_start = j;
+                var cp: u32 = 0;
+                var overflowed = false;
+                while (j < s.len and s[j] != ';') : (j += 1) {
+                    const c = s[j];
+                    const digit: u32 = if (c >= '0' and c <= '9')
+                        c - '0'
+                    else if (hex and c >= 'a' and c <= 'f')
+                        10 + (c - 'a')
+                    else if (hex and c >= 'A' and c <= 'F')
+                        10 + (c - 'A')
+                    else
+                        break;
+                    cp = cp *% (if (hex) @as(u32, 16) else 10) +% digit;
+                    if (cp > 0x10FFFF) overflowed = true;
+                }
+                if (j < s.len and s[j] == ';' and j > digits_start and !overflowed and cp > 0) {
+                    var enc: [4]u8 = undefined;
+                    const n = encodeUtf8(cp, &enc);
+                    @memcpy(buf[out_len..][0..n], enc[0..n]);
+                    out_len += n;
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        buf[out_len] = s[i];
+        out_len += 1;
+        i += 1;
+    }
+    return buf[0..out_len];
+}
+
 fn trim(s: []const u8) []const u8 {
     return std.mem.trim(u8, s, " \t\n\r");
 }
@@ -231,7 +344,7 @@ fn parseAttrs(s: []const u8, allocator: std.mem.Allocator) []Attr {
                 }
             }
         }
-        attrs[count] = .{ .name = dup(allocator, name), .value = dup(allocator, value) };
+        attrs[count] = .{ .name = dup(allocator, name), .value = decodeEntities(value, allocator) };
         count += 1;
     }
     if (count == 0) return &.{};
@@ -762,6 +875,21 @@ export fn kk_dom_create_element(tag_ptr: [*]const u8, tag_len: u32) u32 {
 export fn kk_dom_create_text(text_ptr: [*]const u8, text_len: u32) u32 {
     const d = current_doc orelse return 0;
     const node = makeNode(d, arena_buf, .text, "");
+    node.text = dupMut(arena_buf, text_ptr[0..text_len]);
+    return node.id;
+}
+
+/// Creates a new, detached comment node and returns its id. 0 on failure.
+/// document.createComment() was entirely missing before this — the HTML
+/// parser already treats `<!-- -->` as a real .comment node (see parseHtml)
+/// specifically because "frameworks (React hydration/Suspense in
+/// particular) use these as structural markers, e.g. <!--$-->...<!--/$-->",
+/// but nothing let a running page's own JS *create* one the same way at
+/// runtime — exactly what React does when it mounts a new Suspense
+/// boundary rather than parsing one out of static markup.
+export fn kk_dom_create_comment(text_ptr: [*]const u8, text_len: u32) u32 {
+    const d = current_doc orelse return 0;
+    const node = makeNode(d, arena_buf, .comment, "");
     node.text = dupMut(arena_buf, text_ptr[0..text_len]);
     return node.id;
 }

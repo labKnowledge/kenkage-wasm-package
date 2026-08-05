@@ -192,7 +192,7 @@ describe('eval — previously-missing globals now exist and behave pragmatically
 
   it('btoa/atob round-trip a string', async () => {
     const result = await engine.eval("atob(btoa('hello, kenkage!'))");
-    expect(result).toEqual({ success: true, result: 'hello, kenkage!' });
+    expect(result).toEqual({ success: true, result: 'hello, kenkage!', uncaughtErrors: [], consoleMessages: [] });
   });
 
   it('crypto.randomUUID returns a v4-shaped string', async () => {
@@ -232,7 +232,7 @@ describe('eval — previously-missing globals now exist and behave pragmatically
       __kk_flush_timers();
       return await received;
     })()`);
-    expect(result).toEqual({ success: true, result: 'hi' });
+    expect(result).toEqual({ success: true, result: 'hi', uncaughtErrors: [], consoleMessages: [] });
   });
 
   it('a real DOM node exposes ownerDocument and document exposes defaultView (legacy React mount path)', async () => {

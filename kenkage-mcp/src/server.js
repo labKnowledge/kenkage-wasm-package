@@ -49,6 +49,8 @@ server.registerTool(
         scriptsExecuted: page.scriptsExecuted,
         scriptsSkipped: page.scriptsSkipped,
         scriptErrors: page.scriptErrors,
+        uncaughtErrors: page.uncaughtErrors,
+        consoleMessages: page.consoleMessages,
       });
     } catch (err) {
       return errorResult(err);

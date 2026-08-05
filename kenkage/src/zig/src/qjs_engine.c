@@ -91,6 +91,44 @@ static void setup_dom_bindings(JSContext *ctx);
 static void kk_clear_modules(void);
 static JSModuleDef *kk_module_loader(JSContext *ctx, const char *module_name, void *opaque);
 static char *kk_module_normalize(JSContext *ctx, const char *base_name, const char *name, void *opaque);
+static JSValue call_global_fn2(JSContext *ctx, const char *name, JSValueConst a0, JSValueConst a1);
+
+/* A Promise that rejects with nothing ever attached to observe it — no
+ * .then(_, onRejected), no .catch() — is what a real browser's DevTools
+ * flags as "Uncaught (in promise) ...". This engine had no equivalent:
+ * QuickJS *does* track this internally (that's what
+ * JS_SetHostPromiseRejectionTracker plugs into) but nothing here was ever
+ * listening. A rejected dynamic import() — e.g. a lazy-loaded route
+ * component whose module throws at the top level, which is exactly what a
+ * React.lazy()+Suspense+ErrorBoundary chain reduces to — is precisely this
+ * shape: normal control flow from the module system's point of view, so it
+ * never hits scriptErrors (not a top-level <script> failure) or
+ * __kk_record_uncaught's existing listener/timer coverage, and if the
+ * app's own error-boundary reports via Sentry/analytics instead of
+ * console.error (typical in production builds), it leaves zero trace in
+ * consoleMessages either. That combination made an entire page-load
+ * failure completely invisible to every diagnostic this engine had.
+ *
+ * QuickJS calls this twice per promise: once when it rejects with no
+ * handler yet (is_handled=0), and again later if a handler *does* get
+ * attached (is_handled=1) — meaning "false alarm". Matching the
+ * simplification QuickJS's own reference host (quickjs-libc.c's
+ * js_std_promise_rejection_tracker) uses: report immediately on the first
+ * call and don't bother suppressing on a later is_handled=1, since a
+ * .catch() attached after the fact is rare enough not to be worth the
+ * extra bookkeeping. Reuses the existing __kk_uncaught_errors sink rather
+ * than adding a new one, so this shows up in loadPage()'s uncaughtErrors
+ * exactly like a listener/timer exception already does. */
+static void kk_promise_rejection_tracker(JSContext *ctx, JSValueConst promise,
+                                          JSValueConst reason, JS_BOOL is_handled,
+                                          void *opaque) {
+    (void)promise; (void)opaque;
+    if (is_handled) return;
+    JSValue type = JS_NewString(ctx, "unhandledrejection");
+    JSValue result = call_global_fn2(ctx, "__kk_record_uncaught", type, reason);
+    JS_FreeValue(ctx, result);
+    JS_FreeValue(ctx, type);
+}
 
 /* Creates g_ctx (g_rt must already exist) with DOM bindings and the module
  * loader wired up. Shared by qjs_init (first-ever setup) and qjs_reset
@@ -103,6 +141,10 @@ static int kk_init_context(void) {
      * (used only when a module is actually loaded, i.e. after init has
      * fully completed) always finds the polyfill in place. */
     JS_SetModuleLoaderFunc(g_rt, kk_module_normalize, kk_module_loader, NULL);
+    /* Runtime-level (not context-level), but re-registering on every reset
+     * is harmless — matches g_ctx's lifetime rather than tracking g_rt's
+     * separately. */
+    JS_SetHostPromiseRejectionTracker(g_rt, kk_promise_rejection_tracker, NULL);
     return 1;
 }
 
@@ -288,11 +330,20 @@ int qjs_get_global(const char *name) {
  * lookup in this table. (Dynamic `import()` doesn't have this constraint
  * since it's Promise-based already, but isn't wired up yet — out of scope
  * for this pass.)
+ *
+ * The table grows by doubling (js_realloc) rather than using a fixed-size
+ * array: a real-world SPA's reachable import graph routinely runs into the
+ * thousands of modules (route-split chunks, their sub-dependencies, shared
+ * vendor bundles), so any fixed cap gets silently exceeded on exactly the
+ * pages worth testing — qjs_register_module() would previously return -3
+ * once full, a return value the JS host wrapper doesn't check, so
+ * registration failures were invisible until the *next* page's completely
+ * unrelated module lookup mysteriously failed with "not pre-fetched".
  */
-#define KK_MAX_MODULES 256
-static char *g_module_urls[KK_MAX_MODULES];
-static char *g_module_srcs[KK_MAX_MODULES];
+static char **g_module_urls = NULL;
+static char **g_module_srcs = NULL;
 static int g_module_count = 0;
+static int g_module_capacity = 0;
 
 static void kk_clear_modules(void) {
     for (int i = 0; i < g_module_count; i++) {
@@ -312,7 +363,10 @@ void qjs_clear_modules(void) {
 }
 
 /* Registers pre-fetched source for a resolved module URL (last write wins
- * for a repeated url, so re-registering mid-crawl is harmless). */
+ * for a repeated url, so re-registering mid-crawl is harmless). Grows the
+ * backing table (doubling from an initial 256) rather than capping it —
+ * see the comment above g_module_urls for why a fixed cap doesn't hold up
+ * against real-world module graphs. */
 int qjs_register_module(const char *url, int url_len, const char *src, int src_len) {
     if (!g_ctx) return -2;
     for (int i = 0; i < g_module_count; i++) {
@@ -326,7 +380,20 @@ int qjs_register_module(const char *url, int url_len, const char *src, int src_l
             return 0;
         }
     }
-    if (g_module_count >= KK_MAX_MODULES) return -3;
+    if (g_module_count >= g_module_capacity) {
+        int new_capacity = g_module_capacity > 0 ? g_module_capacity * 2 : 256;
+        char **new_urls = js_realloc(g_ctx, g_module_urls, (size_t)new_capacity * sizeof(char *));
+        if (!new_urls) return -2;
+        g_module_urls = new_urls;
+        char **new_srcs = js_realloc(g_ctx, g_module_srcs, (size_t)new_capacity * sizeof(char *));
+        if (!new_srcs) return -2;
+        g_module_srcs = new_srcs;
+        for (int i = g_module_capacity; i < new_capacity; i++) {
+            g_module_urls[i] = NULL;
+            g_module_srcs[i] = NULL;
+        }
+        g_module_capacity = new_capacity;
+    }
     char *url_copy = js_malloc(g_ctx, (size_t)url_len + 1);
     char *src_copy = js_malloc(g_ctx, (size_t)src_len + 1);
     if (!url_copy || !src_copy) {
@@ -478,6 +545,7 @@ int qjs_eval_module(const char *url, int url_len, const char *code, int code_len
  */
 extern uint32_t kk_dom_create_element(const char *tag, uint32_t tag_len);
 extern uint32_t kk_dom_create_text(const char *text, uint32_t text_len);
+extern uint32_t kk_dom_create_comment(const char *text, uint32_t text_len);
 extern int kk_dom_set_attr(uint32_t id, const char *name, uint32_t name_len, const char *val, uint32_t val_len);
 extern int kk_dom_remove_attr(uint32_t id, const char *name, uint32_t name_len);
 extern int kk_dom_set_text_content(uint32_t id, const char *text, uint32_t text_len);
@@ -542,6 +610,17 @@ static uint32_t id_arg(JSContext *ctx, JSValueConst v) {
 
 static JSValue node_get_nodeType(JSContext *ctx, JSValueConst this_val) {
     return JS_NewInt32(ctx, kk_dom_node_type(node_id_of(this_val)));
+}
+
+/* Wrapped node objects have no stable JS identity — every getElementById()/
+ * querySelector() call for the same underlying node produces a brand-new
+ * wrapper object (confirmed: `document.body === document.body` is false).
+ * Anything that needs to key a registry by "which DOM node is this" (a
+ * real MutationObserver's target/subtree bookkeeping, for one) can't use
+ * the wrapper as a Map key — this exposes the stable underlying node id
+ * instead, for exactly that purpose. */
+static JSValue node_get_internal_id(JSContext *ctx, JSValueConst this_val) {
+    return JS_NewInt32(ctx, (int32_t)node_id_of(this_val));
 }
 
 static JSValue node_get_nodeName(JSContext *ctx, JSValueConst this_val) {
@@ -764,6 +843,7 @@ static JSValue node_querySelector(JSContext *ctx, JSValueConst this_val, int arg
 }
 
 static const JSCFunctionListEntry node_proto_funcs[] = {
+    JS_CGETSET_DEF("__kk_internal_id", node_get_internal_id, NULL),
     JS_CGETSET_DEF("nodeType", node_get_nodeType, NULL),
     JS_CGETSET_DEF("nodeName", node_get_nodeName, NULL),
     JS_CGETSET_DEF("tagName", node_get_tagName, NULL),
@@ -857,6 +937,29 @@ static JSValue doc_createTextNode(JSContext *ctx, JSValueConst this_val, int arg
     return wrap_node(ctx, id);
 }
 
+/* Was missing entirely (not even a no-op — calling it threw a real,
+ * engine-level "not a function" TypeError). React's DOM host config uses
+ * comment nodes as structural markers when mounting Suspense boundaries
+ * (`<!--$-->`...`<!--/$-->`) — this app uses React.lazy()+Suspense
+ * throughout its route tree. That throw happens inside React's own
+ * reconciler/commit-phase code, which has its own internal try/catch for
+ * exactly this kind of failure — so it never reaches an app-level error
+ * boundary, console.error, or (being an engine-level throw rather than an
+ * explicit `new TypeError(...)`) even a hook on the global TypeError
+ * constructor. The net effect: React silently abandons that commit with
+ * zero signal on any diagnostic surface this engine has, which is
+ * indistinguishable from "nothing to render" from the outside. */
+static JSValue doc_createComment(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_NULL;
+    size_t len;
+    const char *text = JS_ToCStringLen(ctx, &len, argv[0]);
+    if (!text) return JS_NULL;
+    uint32_t id = kk_dom_create_comment(text, (uint32_t)len);
+    JS_FreeCString(ctx, text);
+    return wrap_node(ctx, id);
+}
+
 static JSValue doc_get_body(JSContext *ctx, JSValueConst this_val) {
     (void)this_val;
     return wrap_node(ctx, kk_dom_body_id());
@@ -901,6 +1004,7 @@ static const JSCFunctionListEntry document_funcs[] = {
     JS_CFUNC_DEF("querySelectorAll", 1, doc_querySelectorAll),
     JS_CFUNC_DEF("createElement", 1, doc_createElement),
     JS_CFUNC_DEF("createTextNode", 1, doc_createTextNode),
+    JS_CFUNC_DEF("createComment", 1, doc_createComment),
     JS_CGETSET_DEF("body", doc_get_body, NULL),
     JS_CGETSET_DEF("head", doc_get_head, NULL),
     JS_CGETSET_DEF("documentElement", doc_get_documentElement, NULL),
@@ -1109,7 +1213,154 @@ static const char *DOM_PRELUDE =
      * *live* HTMLCollection; this returns a static array, close enough for
      * scripts that just index into element [0]). */
     "document.getElementsByTagName = function (tag) { return this.querySelectorAll(tag); };\n"
+    /* Was missing entirely (reads back undefined) — feature-flag SDKs and
+     * analytics libraries very commonly defer their first fetch until the
+     * tab is confirmed foregrounded, checking `document.visibilityState
+     * === 'visible'` specifically (a strict string comparison, not just a
+     * truthiness check) rather than only listening for `visibilitychange`
+     * later. `undefined === 'visible'` is always false, so that check
+     * would never pass and the deferred initialization — which real-world
+     * code frequently gates an entire feature's first network call behind
+     * — would never run, with nothing to observe since it's just a
+     * conditional quietly not taking its branch, not a thrown error.
+     * Matches this engine's already-established default of "assume a
+     * normal, active foreground tab" (see IntersectionObserver/
+     * ResizeObserver above) rather than leaving it unset. */
+    "document.hidden = false;\n"
+    "document.visibilityState = 'visible';\n"
+    /* Also entirely missing before (reads back undefined). Framework
+     * bootstraps very commonly branch on this exact value before deciding
+     * whether to run immediately or wait for DOMContentLoaded/load — e.g.
+     * `if (document.readyState === 'complete') init(); else
+     * window.addEventListener('load', init);`. loadPage() only reaches
+     * script execution after the whole document is already parsed, and by
+     * the time it dispatches DOMContentLoaded/load at the end every
+     * script has already run — 'complete' matches that timeline better
+     * than 'loading'/'interactive' would for the entire span scripts
+     * actually execute in. */
+    "document.readyState = 'complete';\n"
     "__LPWNodeProto.getElementsByTagName = function (tag) { return this.querySelectorAll(tag); };\n"
+    /* Was missing entirely (not even a no-op) — some virtualized-list
+     * libraries call this directly instead of only going through
+     * ResizeObserver to size their container. Matches ResizeObserver's
+     * synthetic rect below so both paths agree on "a normal-sized,
+     * visible viewport" rather than one reporting a size and the other
+     * throwing "not a function". */
+    "__LPWNodeProto.getBoundingClientRect = function () {\n"
+    "  return { x: 0, y: 0, width: 1280, height: 800, top: 0, left: 0, right: 1280, bottom: 800 };\n"
+    "};\n"
+    /* MutationObserver was a pure no-op below this point ('observe()'d
+     * callbacks simply never fire') — wired up for real here instead,
+     * covering the common mutation paths (childList via appendChild/
+     * insertBefore/removeChild, attributes via setAttribute/
+     * removeAttribute). Registered by the underlying node's stable
+     * __kk_internal_id rather than the wrapper object itself, since wrapper
+     * objects have no stable identity (two getElementById() calls for the
+     * same element return unequal objects) — a plain object/Map keyed on
+     * the wrapper would silently never match on the next lookup. Batches
+     * records per observer and delivers via queueMicrotask, matching the
+     * spec's asynchronous delivery timing (multiple synchronous mutations
+     * in the same turn arrive as one callback invocation, not one per
+     * mutation). Known gap: node.remove()/textContent/innerHTML setters
+     * mutate through different native paths not wrapped here, so those
+     * won't be observed — a pragmatic subset covering what real code
+     * calling appendChild/insertBefore/removeChild/setAttribute directly
+     * needs, not full coverage of every mutation path. */
+    "globalThis.__kk_mutation_registry = new Map();\n"
+    "globalThis.__kk_notify_mutation = function (targetNode, records) {\n"
+    "  if (!targetNode || typeof targetNode.__kk_internal_id !== 'number') return;\n"
+    "  let node = targetNode;\n"
+    "  let isTarget = true;\n"
+    "  while (node) {\n"
+    "    const regs = __kk_mutation_registry.get(node.__kk_internal_id);\n"
+    "    if (regs) {\n"
+    "      for (const reg of regs) {\n"
+    "        if (isTarget || reg.options.subtree) {\n"
+    "          reg.observer.__kk_pending.push(...records);\n"
+    "          reg.observer.__kk_schedule();\n"
+    "        }\n"
+    "      }\n"
+    "    }\n"
+    "    node = node.parentNode;\n"
+    "    isTarget = false;\n"
+    "  }\n"
+    "};\n"
+    "(function () {\n"
+    "  const nativeAppendChild = __LPWNodeProto.appendChild;\n"
+    "  __LPWNodeProto.appendChild = function (child) {\n"
+    "    const result = nativeAppendChild.call(this, child);\n"
+    "    __kk_notify_mutation(this, [{ type: 'childList', target: this, addedNodes: [child], removedNodes: [] }]);\n"
+    "    return result;\n"
+    "  };\n"
+    "  const nativeInsertBefore = __LPWNodeProto.insertBefore;\n"
+    "  __LPWNodeProto.insertBefore = function (child, ref) {\n"
+    "    const result = nativeInsertBefore.call(this, child, ref);\n"
+    "    __kk_notify_mutation(this, [{ type: 'childList', target: this, addedNodes: [child], removedNodes: [] }]);\n"
+    "    return result;\n"
+    "  };\n"
+    "  const nativeRemoveChild = __LPWNodeProto.removeChild;\n"
+    "  __LPWNodeProto.removeChild = function (child) {\n"
+    "    const result = nativeRemoveChild.call(this, child);\n"
+    "    __kk_notify_mutation(this, [{ type: 'childList', target: this, addedNodes: [], removedNodes: [child] }]);\n"
+    "    return result;\n"
+    "  };\n"
+    "  const nativeSetAttribute = __LPWNodeProto.setAttribute;\n"
+    "  __LPWNodeProto.setAttribute = function (name, value) {\n"
+    "    const result = nativeSetAttribute.call(this, name, value);\n"
+    "    __kk_notify_mutation(this, [{ type: 'attributes', target: this, attributeName: String(name) }]);\n"
+    "    return result;\n"
+    "  };\n"
+    "  const nativeRemoveAttribute = __LPWNodeProto.removeAttribute;\n"
+    "  __LPWNodeProto.removeAttribute = function (name) {\n"
+    "    const result = nativeRemoveAttribute.call(this, name);\n"
+    "    __kk_notify_mutation(this, [{ type: 'attributes', target: this, attributeName: String(name) }]);\n"
+    "    return result;\n"
+    "  };\n"
+    "})();\n"
+    /* Was missing entirely — `.dataset` (DOMStringMap) is the standard way
+     * real apps read their own `data-*` attributes, and server-rendered
+     * frameworks that hydrate client-side (Inertia.js among them) commonly
+     * bootstrap by reading a `data-page`-style attribute this way to learn
+     * which component to mount and with what props. Without this, element
+     * `.dataset` reads back `undefined`, and code that only null-checks the
+     * *element* before indexing into `.dataset` (`el?.dataset.page`, where
+     * the `?.` guards `el` but not `.dataset`) throws immediately — the
+     * entire hydration step, and everything downstream of it, never runs,
+     * with nothing but a rejected Promise to show for it (see
+     * kk_promise_rejection_tracker above for why that alone stayed
+     * invisible). Implemented as a Proxy over the existing
+     * getAttribute/setAttribute/hasAttribute bindings (kebab-case <->
+     * camelCase per the DOMStringMap spec) rather than a new native
+     * binding — no engine-level attribute-enumeration capability exists to
+     * back a snapshot object, and a live Proxy is actually more spec-
+     * faithful for the read path real code exercises. */
+    "__LPWNodeProto.__kk_dataset_key_to_attr = function (prop) {\n"
+    "  return 'data-' + String(prop).replace(/[A-Z]/g, (m) => '-' + m.toLowerCase());\n"
+    "};\n"
+    "Object.defineProperty(__LPWNodeProto, 'dataset', {\n"
+    "  configurable: true,\n"
+    "  get() {\n"
+    "    const el = this;\n"
+    "    return new Proxy({}, {\n"
+    "      get(_, prop) {\n"
+    "        if (typeof prop !== 'string') return undefined;\n"
+    "        const val = el.getAttribute(el.__kk_dataset_key_to_attr(prop));\n"
+    "        return val === null ? undefined : val;\n"
+    "      },\n"
+    "      set(_, prop, value) {\n"
+    "        el.setAttribute(el.__kk_dataset_key_to_attr(prop), String(value));\n"
+    "        return true;\n"
+    "      },\n"
+    "      has(_, prop) {\n"
+    "        return typeof prop === 'string' && el.hasAttribute(el.__kk_dataset_key_to_attr(prop));\n"
+    "      },\n"
+    "      deleteProperty(_, prop) {\n"
+    "        if (typeof prop === 'string') el.removeAttribute(el.__kk_dataset_key_to_attr(prop));\n"
+    "        return true;\n"
+    "      },\n"
+    "    });\n"
+    "  },\n"
+    "});\n"
     "globalThis.Event = class Event {\n"
     "  constructor(type, init) {\n"
     "    this.type = String(type);\n"
@@ -1296,11 +1547,39 @@ static const char *DOM_PRELUDE =
     "globalThis.__kk_uncaught_errors = [];\n"
     "globalThis.__kk_record_uncaught = function (type, e) {\n"
     "  const message = (e && e.message) ? String(e.message) : String(e);\n"
-    "  __kk_uncaught_errors.push({ type: String(type), message });\n"
+    "  const stack = (e && e.stack) ? String(e.stack) : undefined;\n"
+    "  __kk_uncaught_errors.push({ type: String(type), message, stack });\n"
     "};\n"
     "globalThis.__kk_drain_uncaught_errors = function () {\n"
     "  const out = __kk_uncaught_errors;\n"
     "  __kk_uncaught_errors = [];\n"
+    "  return out;\n"
+    "};\n"
+    /* console.log/warn/error/info are native no-ops (see console_log in the
+     * C bindings above) — real pages, and React in particular, lean on
+     * console.error to report caught render/lifecycle errors (error
+     * boundaries, failed effects, prop-type warnings) that never throw far
+     * enough to hit __kk_record_uncaught above. Discarding them meant a
+     * page could fail entirely client-side with zero signal anywhere in
+     * loadPage()'s result. Wrapping them here (rather than changing the
+     * native functions) keeps the C fallback harmless while giving the host
+     * an actual transcript via __kk_drain_console_messages. */
+    "globalThis.__kk_console_messages = [];\n"
+    "(function () {\n"
+    "  const stringify = (a) => {\n"
+    "    if (typeof a === 'string') return a;\n"
+    "    if (a instanceof Error) return a.stack || a.message || String(a);\n"
+    "    try { return JSON.stringify(a); } catch (e) { return String(a); }\n"
+    "  };\n"
+    "  for (const level of ['log', 'warn', 'error', 'info']) {\n"
+    "    console[level] = function (...args) {\n"
+    "      __kk_console_messages.push({ level, message: args.map(stringify).join(' ') });\n"
+    "    };\n"
+    "  }\n"
+    "})();\n"
+    "globalThis.__kk_drain_console_messages = function () {\n"
+    "  const out = __kk_console_messages;\n"
+    "  __kk_console_messages = [];\n"
     "  return out;\n"
     "};\n"
     "globalThis.__kk_timer_queue = [];\n"
@@ -1392,6 +1671,53 @@ static const char *DOM_PRELUDE =
     "  if (!p) return;\n"
     "  __kk_pending_fetches.delete(id);\n"
     "  p.reject(new Error(message));\n"
+    "};\n"
+    /* Genuinely dynamic import() support: crawlModuleGraph (host side) can
+     * only pre-fetch specifiers it can see as literal text — a computed
+     * specifier (`import(\`./pages/${name}.js\`)`) or a chunk imported for
+     * the first time only after loadPage() has already returned (e.g. a
+     * click handler firing later) is invisible to it no matter how
+     * thoroughly it crawls. JS syntax gives no way to intercept the native
+     * `import()` expression itself (it's a keyword, not a patchable
+     * function), so the host rewrites `import(x)` call sites in fetched
+     * source into `__kk_dynamic_import(x, moduleUrl)` before registering
+     * them (see rewriteDynamicImports in index.ts) — the same
+     * source-transform technique Babel's dynamic-import plugin and
+     * SystemJS use, since neither can intercept the keyword either.
+     *
+     * This queues the request exactly like fetch() above and returns a
+     * pending Promise. The host peeks it, fetches the target module's
+     * bytes, registers it (and crawls *its* statically-visible
+     * dependencies via the existing machinery), and only then evaluates a
+     * real `await import(url)` from inside the sandbox to actually settle
+     * this promise — deliberately not hand-rolling module linking/
+     * evaluation or trying to marshal a namespace object across the
+     * WASM boundary as a string. The registered module is now sitting in
+     * the same pre-fetch table crawlModuleGraph populates, so that real
+     * import() resolves synchronously through the exact mechanism that
+     * already works for eagerly-discovered specifiers. */
+    "globalThis.__kk_pending_module_requests = new Map();\n"
+    "globalThis.__kk_module_request_queue = [];\n"
+    "globalThis.__kk_module_request_next_id = 1;\n"
+    "globalThis.__kk_dynamic_import = function (specifier, baseUrl) {\n"
+    "  const id = __kk_module_request_next_id++;\n"
+    // Ad-hoc eval() calls (as opposed to a specific <script>/module being
+    // rewritten with its own known URL) have no moduleUrl to bake in at
+    // rewrite time, so they pass `undefined` here — fall back to the
+    // page's current location, same as fetch() above does for the same
+    // reason (a plain eval() with no navigation context has neither and
+    // ends up trying the possibly-relative string untouched).
+    "  const base = baseUrl || (globalThis.location && globalThis.location.href !== 'about:blank' ? globalThis.location.href : undefined);\n"
+    "  let resolvedUrl;\n"
+    "  try { resolvedUrl = new URL(String(specifier), base).href; }\n"
+    "  catch (e) { resolvedUrl = String(specifier); }\n"
+    "  return new Promise((resolve, reject) => {\n"
+    "    __kk_pending_module_requests.set(id, { resolve, reject });\n"
+    "    __kk_module_request_queue.push({ id, url: resolvedUrl });\n"
+    "  });\n"
+    "};\n"
+    "globalThis.__kk_next_module_request = function () {\n"
+    "  return __kk_module_request_queue.shift() || null;\n"
     "};\n"
     /* Vanilla QuickJS (unlike quickjs-ng or a real browser) never links ICU
      * and has no `Intl` global at all — any script that references it
@@ -1493,28 +1819,76 @@ static const char *DOM_PRELUDE =
     "  disconnect() { this.targets.clear(); }\n"
     "  takeRecords() { return []; }\n"
     "};\n"
+    /* A reported 0x0 size (the previous behavior) reads as "this element
+     * has no space" to any consumer — and the overwhelmingly common
+     * consumer of ResizeObserver in real apps is a virtualized/windowed
+     * list (react-window, @tanstack/react-virtual, etc.) computing how
+     * many rows fit its container. Zero space means zero visible rows,
+     * and since these libraries typically only fetch the data for rows
+     * they're about to render, that silently starves the very
+     * data-fetching this engine exists to observe — a page can look
+     * completely empty with no error anywhere. Reporting a plausible
+     * desktop-viewport-sized rect instead (matching the spirit of
+     * IntersectionObserver's "assume visible" above) lets these
+     * virtualizers compute a normal, non-empty visible range. */
     "globalThis.ResizeObserver = class ResizeObserver {\n"
     "  constructor(callback) { this.callback = callback; this.targets = new Set(); }\n"
     "  observe(target) {\n"
     "    this.targets.add(target);\n"
     "    queueMicrotask(() => {\n"
     "      if (!this.targets.has(target)) return;\n"
-    "      const rect = { width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 };\n"
-    "      this.callback([{ target, contentRect: rect, borderBoxSize: [{ inlineSize: 0, blockSize: 0 }], contentBoxSize: [{ inlineSize: 0, blockSize: 0 }] }], this);\n"
+    "      const width = 1280, height = 800;\n"
+    "      const rect = { width, height, top: 0, left: 0, right: width, bottom: height };\n"
+    "      this.callback([{ target, contentRect: rect, borderBoxSize: [{ inlineSize: width, blockSize: height }], contentBoxSize: [{ inlineSize: width, blockSize: height }] }], this);\n"
     "    });\n"
     "  }\n"
     "  unobserve(target) { this.targets.delete(target); }\n"
     "  disconnect() { this.targets.clear(); }\n"
     "};\n"
-    /* Unlike Intersection/ResizeObserver, firing a synthetic mutation record
-     * on every observe() would be actively wrong (there's no mutation to
-     * report yet) — this stays a genuine no-op. Real DOM mutations aren't
-     * tracked by this shim at all; observe()'d callbacks simply never fire. */
+    /* Real implementation — see __kk_notify_mutation/__kk_mutation_registry
+     * and the appendChild/insertBefore/removeChild/setAttribute/
+     * removeAttribute wrapping above, which is what actually feeds this. */
     "globalThis.MutationObserver = class MutationObserver {\n"
-    "  constructor(callback) { this.callback = callback; }\n"
-    "  observe() {}\n"
-    "  disconnect() {}\n"
-    "  takeRecords() { return []; }\n"
+    "  constructor(callback) {\n"
+    "    this.callback = callback;\n"
+    "    this.__kk_pending = [];\n"
+    "    this.__kk_scheduled = false;\n"
+    "    this.__kk_targets = [];\n"
+    "  }\n"
+    "  __kk_schedule() {\n"
+    "    if (this.__kk_scheduled) return;\n"
+    "    this.__kk_scheduled = true;\n"
+    "    queueMicrotask(() => {\n"
+    "      this.__kk_scheduled = false;\n"
+    "      const records = this.__kk_pending;\n"
+    "      this.__kk_pending = [];\n"
+    "      if (records.length) this.callback(records, this);\n"
+    "    });\n"
+    "  }\n"
+    "  observe(target, options) {\n"
+    "    if (!target || typeof target.__kk_internal_id !== 'number') return;\n"
+    "    const id = target.__kk_internal_id;\n"
+    "    let regs = __kk_mutation_registry.get(id);\n"
+    "    if (!regs) { regs = new Set(); __kk_mutation_registry.set(id, regs); }\n"
+    "    const reg = { observer: this, options: options || {} };\n"
+    "    regs.add(reg);\n"
+    "    this.__kk_targets.push({ id, reg });\n"
+    "  }\n"
+    "  disconnect() {\n"
+    "    for (const { id, reg } of this.__kk_targets) {\n"
+    "      const regs = __kk_mutation_registry.get(id);\n"
+    "      if (!regs) continue;\n"
+    "      regs.delete(reg);\n"
+    "      if (regs.size === 0) __kk_mutation_registry.delete(id);\n"
+    "    }\n"
+    "    this.__kk_targets = [];\n"
+    "    this.__kk_pending = [];\n"
+    "  }\n"
+    "  takeRecords() {\n"
+    "    const r = this.__kk_pending;\n"
+    "    this.__kk_pending = [];\n"
+    "    return r;\n"
+    "  }\n"
     "};\n"
     "globalThis.matchMedia = function (query) {\n"
     "  return {\n"

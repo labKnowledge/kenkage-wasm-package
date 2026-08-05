@@ -88,6 +88,138 @@ fn dupMut(allocator: std.mem.Allocator, s: []const u8) []u8 {
     return allocator.dupe(u8, s) catch @constCast(s);
 }
 
+/// Encodes a Unicode codepoint as UTF-8 into `buf`, returning the byte
+/// count written (1-4). Written by hand rather than via std.unicode to
+/// avoid depending on that module's exact API surface in this Zig
+/// version; the encoding itself is the standard, unchanging UTF-8 scheme.
+fn encodeUtf8(cp: u32, buf: *[4]u8) usize {
+    if (cp < 0x80) {
+        buf[0] = @intCast(cp);
+        return 1;
+    } else if (cp < 0x800) {
+        buf[0] = 0xC0 | @as(u8, @intCast(cp >> 6));
+        buf[1] = 0x80 | @as(u8, @intCast(cp & 0x3F));
+        return 2;
+    } else if (cp < 0x10000) {
+        buf[0] = 0xE0 | @as(u8, @intCast(cp >> 12));
+        buf[1] = 0x80 | @as(u8, @intCast((cp >> 6) & 0x3F));
+        buf[2] = 0x80 | @as(u8, @intCast(cp & 0x3F));
+        return 3;
+    } else {
+        buf[0] = 0xF0 | @as(u8, @intCast(cp >> 18));
+        buf[1] = 0x80 | @as(u8, @intCast((cp >> 12) & 0x3F));
+        buf[2] = 0x80 | @as(u8, @intCast((cp >> 6) & 0x3F));
+        buf[3] = 0x80 | @as(u8, @intCast(cp & 0x3F));
+        return 4;
+    }
+}
+
+/// Decodes the handful of HTML character references real markup actually
+/// uses (the five XML-derived named entities plus numeric `&#NNN;`/
+/// `&#xHHH;` references) — not the full 2000+-entry HTML5 named-entity
+/// table, but enough for the overwhelming majority of real pages,
+/// following this codebase's existing "pragmatic subset" approach
+/// elsewhere. This was entirely missing before: attribute values were
+/// stored as the raw bytes between quotes with no decoding at all, which
+/// is invisible for plain text but silently corrupts the extremely common
+/// pattern of JSON embedded in an attribute (server-rendered frameworks
+/// serializing initial page state into e.g. `data-page="{&quot;...&quot;}"`
+/// — literal `"` inside a double-quoted attribute value is *required* by
+/// the HTML spec to be entity-escaped this way) — `JSON.parse()` on the
+/// undecoded string fails immediately since it sees a literal `&` where a
+/// property-name-opening `"` belongs.
+///
+/// Decoded output is always <= input length (every entity this handles
+/// collapses to 1-4 bytes from a longer source), so writing into a
+/// same-length buffer can't overflow.
+fn decodeEntities(s: []const u8, allocator: std.mem.Allocator) []const u8 {
+    if (std.mem.indexOfScalar(u8, s, '&') == null) return dup(allocator, s);
+    const buf = allocator.alloc(u8, s.len) catch return dup(allocator, s);
+    var out_len: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '&') {
+            if (std.mem.startsWith(u8, s[i..], "&quot;")) {
+                buf[out_len] = '"';
+                out_len += 1;
+                i += 6;
+                continue;
+            }
+            if (std.mem.startsWith(u8, s[i..], "&apos;")) {
+                buf[out_len] = '\'';
+                out_len += 1;
+                i += 6;
+                continue;
+            }
+            if (std.mem.startsWith(u8, s[i..], "&lt;")) {
+                buf[out_len] = '<';
+                out_len += 1;
+                i += 4;
+                continue;
+            }
+            if (std.mem.startsWith(u8, s[i..], "&gt;")) {
+                buf[out_len] = '>';
+                out_len += 1;
+                i += 4;
+                continue;
+            }
+            if (std.mem.startsWith(u8, s[i..], "&nbsp;")) {
+                buf[out_len] = ' ';
+                out_len += 1;
+                i += 6;
+                continue;
+            }
+            // &amp; must be checked after &quot;/&apos;/&lt;/&gt; matches
+            // above would already have consumed their own leading '&' —
+            // order here doesn't actually matter (prefixes are distinct)
+            // but is kept last to mirror "least specific wins last".
+            if (std.mem.startsWith(u8, s[i..], "&amp;")) {
+                buf[out_len] = '&';
+                out_len += 1;
+                i += 5;
+                continue;
+            }
+            // Numeric character reference: &#123; or &#x1F600;
+            if (i + 2 < s.len and s[i + 1] == '#') {
+                var j = i + 2;
+                var hex = false;
+                if (j < s.len and (s[j] == 'x' or s[j] == 'X')) {
+                    hex = true;
+                    j += 1;
+                }
+                const digits_start = j;
+                var cp: u32 = 0;
+                var overflowed = false;
+                while (j < s.len and s[j] != ';') : (j += 1) {
+                    const c = s[j];
+                    const digit: u32 = if (c >= '0' and c <= '9')
+                        c - '0'
+                    else if (hex and c >= 'a' and c <= 'f')
+                        10 + (c - 'a')
+                    else if (hex and c >= 'A' and c <= 'F')
+                        10 + (c - 'A')
+                    else
+                        break;
+                    cp = cp *% (if (hex) @as(u32, 16) else 10) +% digit;
+                    if (cp > 0x10FFFF) overflowed = true;
+                }
+                if (j < s.len and s[j] == ';' and j > digits_start and !overflowed and cp > 0) {
+                    var enc: [4]u8 = undefined;
+                    const n = encodeUtf8(cp, &enc);
+                    @memcpy(buf[out_len..][0..n], enc[0..n]);
+                    out_len += n;
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        buf[out_len] = s[i];
+        out_len += 1;
+        i += 1;
+    }
+    return buf[0..out_len];
+}
+
 fn trim(s: []const u8) []const u8 {
     return std.mem.trim(u8, s, " \t\n\r");
 }
@@ -185,7 +317,7 @@ fn parseAttrs(s: []const u8, allocator: std.mem.Allocator) []Attr {
                 }
             }
         }
-        attrs[count] = .{ .name = dup(allocator, name), .value = dup(allocator, value) };
+        attrs[count] = .{ .name = dup(allocator, name), .value = decodeEntities(value, allocator) };
         count += 1;
     }
     if (count == 0) return &.{};

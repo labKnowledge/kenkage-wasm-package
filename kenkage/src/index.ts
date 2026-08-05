@@ -36,8 +36,44 @@ export interface KenkageWasm {
   nodeChildCount(id: number): number;
   /** Get child node IDs of a node. */
   nodeChildren(id: number): number[];
-  /** Evaluate JavaScript code using the host's JS engine. */
-  eval(code: string): Promise<{ success: boolean; result: string }>;
+  /**
+   * Evaluate JavaScript code using the host's JS engine.
+   *
+   * On the 'full' engine, this doesn't just run `code` and return —
+   * afterward it drains the same way loadPage() does: Promise
+   * microtasks, the timer queue, any fetch() calls the code triggered,
+   * and any dynamic import() it made (including ones with a specifier
+   * that couldn't be known ahead of time, resolved via the same
+   * on-demand mechanism as loadPage()'s eager crawl). This is what
+   * makes calling eval() *after* loadPage() has already returned able to
+   * do real, load-bearing work — e.g. `engine.eval("document.querySelector('button').click()")`
+   * on the same still-alive page — rather than only ever settling things
+   * that happened to still be in flight from the original page load.
+   * `uncaughtErrors`/`consoleMessages` are only ever present on the
+   * 'full' engine; they reflect activity from this call only, not a
+   * running total (call loadPage()'s or drain them yourself between
+   * calls if you need the full history).
+   */
+  eval(code: string): Promise<{
+    success: boolean;
+    result: string;
+    uncaughtErrors?: { type: string; message: string }[];
+    consoleMessages?: { level: string; message: string }[];
+  }>;
+  /**
+   * Runs the same post-eval settle loop eval() does — Promise microtasks,
+   * timers, pending fetch() calls, pending dynamic import() requests —
+   * without evaluating any new code first. Useful after dispatching a
+   * native event or similar host-side interaction that doesn't itself go
+   * through eval(), or simply to let any in-flight async work (a retry
+   * timer, a slow fetch) finish before inspecting the page again. A no-op
+   * that returns empty arrays on the 'core' engine (no JS engine to have
+   * pending work in the first place).
+   */
+  settle(): Promise<{
+    uncaughtErrors: { type: string; message: string }[];
+    consoleMessages: { level: string; message: string }[];
+  }>;
   /** Fetch a URL using the host's fetch API. Returns the response. */
   fetch(url: string, options?: { method?: string; headers?: Record<string, string>; body?: string }): Promise<{ status: number; body: string }>;
   /**
@@ -78,6 +114,33 @@ export interface LoadPageOptions {
    * can't reach.
    */
   fetchFn?: (url: string) => Promise<{ status: number; body: string }>;
+  /**
+   * When true, `LoadPageResult.trace` is populated with a step-by-step
+   * log of every significant thing loadPage()'s *own orchestration code*
+   * did — every script found/executed, every specifier crawlModuleGraph
+   * discovered, every fetch/module request queued and serviced, every
+   * settle round. This is deliberately about this engine's own control
+   * flow, not the page's behavior: when a page silently fails to fully
+   * render with zero errors anywhere, the open question is often "did our
+   * code actually do everything it was supposed to, or did something
+   * here quietly stop partway through?" — this answers that directly,
+   * without having to instrument the page itself to find out.
+   * Off by default: a real page can generate thousands of trace events,
+   * and most callers never need them.
+   */
+  trace?: boolean;
+}
+
+/**
+ * One step in loadPage()'s own internal workflow — see LoadPageOptions.trace.
+ * `t` is milliseconds since this loadPage() call started (not wall-clock
+ * time), so a trace is comparable/diffable across separate runs.
+ */
+export interface TraceEvent {
+  seq: number;
+  t: number;
+  type: string;
+  detail?: Record<string, unknown>;
 }
 
 export interface LoadPageResult {
@@ -102,6 +165,17 @@ export interface LoadPageResult {
    * the actual reason expected content or API calls didn't happen.
    */
   uncaughtErrors: { type: string; message: string }[];
+  /**
+   * Everything the page's own scripts passed to `console.log/warn/error/
+   * info`. React (and most frameworks) report caught render/lifecycle
+   * errors — failed error boundaries, effect failures, prop-type
+   * warnings — via `console.error` without ever throwing far enough to
+   * surface in `scriptErrors` or `uncaughtErrors`, so this is often the
+   * only place a client-side-only failure leaves any trace at all.
+   */
+  consoleMessages: { level: string; message: string }[];
+  /** Only populated when `LoadPageOptions.trace` was true; empty otherwise. */
+  trace: TraceEvent[];
 }
 
 export interface KenkageOptions {
@@ -371,6 +445,34 @@ export async function createKenkage(
     jsEngineReady = true;
   }
 
+  /**
+   * Carried across a loadPage() call and every eval()/settle() call made
+   * afterward, on the *same* engine instance and JS realm — this is what
+   * makes dynamic import()/fetch() calls triggered after the page has
+   * already "loaded" (a later click handler, a deferred retry, a
+   * subsequent eval() the host makes to poke at the live page) still able
+   * to resolve for real, instead of only working during loadPage()'s own
+   * one-shot orchestration loop. Reset at the top of every loadPage() call
+   * (a fresh page load gets a fresh realm via kk_js_reset() anyway, so a
+   * stale visited-set or fetcher from a *previous* page would be wrong);
+   * left untouched by eval()/settle() so they keep reusing whatever the
+   * most recent loadPage() established.
+   */
+  let activeDoFetch: (url: string) => Promise<{ status: number; body: string }> = (u) => api.fetch(u);
+  let activeModuleVisited = new Set<string>();
+
+  // ── Trace instrumentation (LoadPageOptions.trace) ────────────────
+  // See TraceEvent's doc comment. `tracing`/`traceEvents`/`traceStart` are
+  // reset at the top of every loadPage() call so a run's trace only ever
+  // reflects that one call, never a previous one bleeding in.
+  let tracing = false;
+  let traceEvents: TraceEvent[] = [];
+  let traceStart = 0;
+  function trace(type: string, detail?: Record<string, unknown>): void {
+    if (!tracing) return;
+    traceEvents.push({ seq: traceEvents.length, t: Date.now() - traceStart, type, detail });
+  }
+
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
 
@@ -404,6 +506,111 @@ export async function createKenkage(
   );
 
   // ── Internal helpers ──────────────────────────────────────────
+
+  /**
+   * kk_js_run_pending_jobs() does exactly one pass: drain every currently-
+   * queued Promise reaction, then flush the timer queue once. It does NOT
+   * loop back to drain reactions a *timer* callback just queued (e.g. a
+   * timer resolving a Promise whose .then() schedules another timer) — that
+   * needs a second call. A single-call site therefore only fully settles a
+   * chain that alternates Promise reactions and timers a small, fixed
+   * number of times.
+   *
+   * React 18's concurrent scheduler is exactly such a chain: each unit of
+   * work it can't finish synchronously yields via MessageChannel
+   * (our shim resolves this through setTimeout), whose callback runs more
+   * work and, if there's still more, schedules *another* yield the same
+   * way. A component tree with enough items needs many rounds to fully
+   * render. Calling kk_js_run_pending_jobs() once — or a handful of fixed
+   * times, as loadPage() previously did (once per <script> tag) — cuts
+   * this off partway through: the page's own scripts finish executing long
+   * before the scheduler's self-perpetuating chain does, so loadPage()
+   * stopped pumping while React was still mid-render. Nothing throws (nothing
+   * failed), so this produces zero signal anywhere — no scriptError, no
+   * uncaughtError, no console output — just a DOM that silently never
+   * finished mounting.
+   *
+   * Looping here until a call reports zero combined job+timer activity
+   * (its return value) mimics what an idle real browser tab does
+   * continuously; the bound guards against a page's own genuinely-infinite
+   * chain (a polling setInterval, an unresolved retry loop) from hanging
+   * the page load forever.
+   */
+  function drainJobsAndTimers(): void {
+    for (let guard = 0; guard < 2000; guard++) {
+      const activity = exports.kk_js_run_pending_jobs?.() ?? 0;
+      if (activity <= 0) break;
+    }
+  }
+
+  /**
+   * The actual eval primitive — drains jobs/timers but NOT pending fetch()
+   * or dynamic-import() requests. Every internal caller (drainUncaughtErrors,
+   * drainConsoleMessages, drainPendingFetches, drainPendingModuleRequests,
+   * evalModule, loadPage()'s own script loop) goes through this, not the
+   * public api.eval(). Those drain functions peek/settle queues by
+   * evaluating small snippets themselves — if that peek/settle eval() call
+   * ALSO triggered a fresh round of fetch/module draining (what the public
+   * eval() does, see below), each one would recursively invoke the very
+   * drain loop it's already running inside of. api.eval() exists precisely
+   * to add that extra settle step for *external* callers; internal
+   * plumbing needs the bare primitive.
+   */
+  async function evalRaw(code: string): Promise<{ success: boolean; result: string }> {
+    // 'full' engine build: run the code inside the in-WASM QuickJS
+    // engine — fully sandboxed, no host JS execution involved.
+    if (exports.kk_js_eval) {
+      ensureJsEngine();
+      const codeLen = writeStringAt(code, EVAL_FETCH_OFFSET);
+      const rc = exports.kk_js_eval(EVAL_FETCH_OFFSET, codeLen);
+      // Drain Promise microtasks and the setTimeout queue — real JS hosts
+      // do this after every turn of script execution, not on request.
+      drainJobsAndTimers();
+      // Read directly rather than through cachedRead: the result/error
+      // buffers are static C arrays at a fixed address, so ptr+len alone
+      // can't distinguish two different values that happen to share a
+      // length — it would serve stale content back.
+      const mem = new Uint8Array(exports.memory.buffer);
+      if (rc === 0) {
+        const ptr = exports.kk_js_get_result!();
+        const len = exports.kk_js_get_result_len!();
+        return { success: true, result: decoder.decode(mem.slice(ptr, ptr + len)) };
+      }
+      const ptr = exports.kk_js_get_error!();
+      const len = exports.kk_js_get_error_len!();
+      return { success: false, result: decoder.decode(mem.slice(ptr, ptr + len)) };
+    }
+
+    // 'core' engine build: no in-WASM JS engine — delegate to the host.
+    // 1. Write code to WASM memory at EVAL_FETCH_OFFSET
+    const codeLen = writeStringAt(code, EVAL_FETCH_OFFSET);
+
+    // 2. Signal WASM that a JS eval request is pending
+    exports.kk_eval_js_request(EVAL_FETCH_OFFSET, codeLen);
+
+    // 3. Execute the code in the host JS engine
+    // Use eval() to get the completion value (last expression result),
+    // falling back to new Function() for multi-statement code blocks.
+    let success = false;
+    let resultStr = '';
+
+    try {
+      const value = eval(code);
+      resultStr = value === undefined ? 'undefined' : String(value);
+      success = true;
+    } catch (err: unknown) {
+      success = false;
+      resultStr = err instanceof Error ? err.message : String(err);
+    }
+
+    // 4. Write result back to WASM memory
+    const resultLen = writeStringAt(resultStr, EVAL_FETCH_OFFSET);
+
+    // 5. Deliver result to WASM
+    exports.kk_eval_js_complete(success ? 1 : 0, EVAL_FETCH_OFFSET, resultLen);
+
+    return { success, result: resultStr };
+  }
 
   function writeString(str: string): number {
     const bytes = encoder.encode(str);
@@ -446,7 +653,23 @@ export async function createKenkage(
    * __kk_record_uncaught in the DOM prelude.
    */
   async function drainUncaughtErrors(): Promise<{ type: string; message: string }[]> {
-    const res = await api.eval('JSON.stringify(__kk_drain_uncaught_errors())');
+    const res = await evalRaw('JSON.stringify(__kk_drain_uncaught_errors())');
+    if (!res.success) return [];
+    try {
+      return JSON.parse(res.result);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Reads and clears the sandbox's __kk_console_messages sink — everything
+   * passed to console.log/warn/error/info during script execution. See the
+   * console wrapper installed in the DOM prelude (qjs_engine.c) for why
+   * this exists alongside drainUncaughtErrors.
+   */
+  async function drainConsoleMessages(): Promise<{ level: string; message: string }[]> {
+    const res = await evalRaw('JSON.stringify(__kk_drain_console_messages())');
     if (!res.success) return [];
     try {
       return JSON.parse(res.result);
@@ -467,9 +690,10 @@ export async function createKenkage(
   async function drainPendingFetches(
     doFetch: (url: string) => Promise<{ status: number; body: string }>,
     uncaughtErrors: { type: string; message: string }[],
+    consoleMessages: { level: string; message: string }[],
   ): Promise<void> {
     for (let guard = 0; guard < 100; guard++) {
-      const peek = await api.eval('JSON.stringify(__kk_next_fetch_request())');
+      const peek = await evalRaw('JSON.stringify(__kk_next_fetch_request())');
       if (!peek.success) break;
       let req: { id: number; url: string; method: string } | null;
       try {
@@ -483,13 +707,139 @@ export async function createKenkage(
         const { status, body } = await doFetch(req.url);
         const bodyLen = writeStringAt(body, EVAL_FETCH_OFFSET);
         exports.kk_js_resolve_fetch?.(req.id, status, EVAL_FETCH_OFFSET, bodyLen);
+        trace('fetch-settled', { url: req.url, status, bodyLen: body.length });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         const msgLen = writeStringAt(message, EVAL_FETCH_OFFSET);
         exports.kk_js_reject_fetch?.(req.id, EVAL_FETCH_OFFSET, msgLen);
+        trace('fetch-rejected', { url: req.url, message });
       }
-      exports.kk_js_run_pending_jobs?.();
+      drainJobsAndTimers();
       uncaughtErrors.push(...(await drainUncaughtErrors()));
+      consoleMessages.push(...(await drainConsoleMessages()));
+    }
+  }
+
+  /**
+   * Settles pending __kk_dynamic_import() requests — the on-demand
+   * counterpart to crawlModuleGraph's eager pre-fetching, for specifiers
+   * that couldn't be seen as literal text ahead of time (see
+   * rewriteDynamicImports). `visited` is the SAME set crawlModuleGraph
+   * uses, shared across a whole loadPage() call (and, via settle(), across
+   * calls made after it returns too) — a specifier already known from
+   * eager crawling is settled directly with no redundant re-fetch; the
+   * fetch only happens for something genuinely new. Loops (bounded) for
+   * the same reason drainPendingFetches does: settling one request's
+   * dependent code can itself queue another dynamic import.
+   */
+  async function drainPendingModuleRequests(
+    doFetch: (url: string) => Promise<{ status: number; body: string }>,
+    visited: Set<string>,
+    errors: { src?: string; message: string }[],
+    uncaughtErrors: { type: string; message: string }[],
+    consoleMessages: { level: string; message: string }[],
+  ): Promise<void> {
+    for (let guard = 0; guard < 100; guard++) {
+      const peek = await evalRaw('JSON.stringify(__kk_next_module_request())');
+      if (!peek.success) break;
+      let req: { id: number; url: string } | null;
+      try {
+        req = JSON.parse(peek.result);
+      } catch {
+        break;
+      }
+      if (!req) break;
+
+      const cacheHit = visited.has(req.url);
+      trace('dynamic-import-request', { id: req.id, url: req.url, cacheHit });
+      if (!cacheHit) {
+        visited.add(req.url);
+        try {
+          const res = await doFetch(req.url);
+          registerModule(req.url, res.body);
+          await crawlModuleGraph(req.url, res.body, doFetch, visited, errors);
+        } catch (err) {
+          trace('dynamic-import-fetch-failed', { url: req.url, message: err instanceof Error ? err.message : String(err) });
+          // Deliberately not recorded in `errors`/scriptErrors: a dynamic
+          // import() failing to fetch is normal, expected-to-be-handled
+          // Promise rejection (real browsers treat it exactly the same
+          // way — apps commonly wrap lazy-loaded routes in retry/fallback
+          // logic specifically for this). scriptErrors' documented meaning
+          // is a top-level <script> tag failing outright; conflating the
+          // two would flag perfectly-handled app-level error recovery as
+          // if the page itself were broken. Leaving the module
+          // unregistered means the settle step below rejects the pending
+          // import() promise on its own — that's the correct outcome.
+        }
+      }
+
+      // Settle entirely inside the sandbox: a real import() now resolves
+      // synchronously through the same pre-fetch table crawlModuleGraph
+      // populates, producing a properly-linked namespace object with no
+      // value crossing the WASM boundary — see __kk_dynamic_import's
+      // comment in the DOM prelude for why this is deliberately not
+      // hand-rolled here. Returns a plain status string (not the
+      // namespace object itself) purely so the trace can record whether
+      // this specific settle resolved or rejected — evalRaw's own
+      // success/result reflects this IIFE completing, not what happened
+      // to the underlying import().
+      const settleResult = await evalRaw(`(async () => {
+        const req = __kk_pending_module_requests.get(${req.id});
+        if (!req) return 'no-pending-request';
+        __kk_pending_module_requests.delete(${req.id});
+        try { req.resolve(await import(${JSON.stringify(req.url)})); return 'resolved'; }
+        catch (e) { req.reject(e); return 'rejected:' + (e && e.message); }
+      })();`);
+      trace('dynamic-import-settle', { id: req.id, url: req.url, outcome: settleResult.success ? settleResult.result : 'evalRaw-failed:' + settleResult.result });
+      uncaughtErrors.push(...(await drainUncaughtErrors()));
+      consoleMessages.push(...(await drainConsoleMessages()));
+    }
+  }
+
+  /**
+   * Drains fetch() and dynamic-import() requests together to a genuine
+   * *joint* fixed point, not just one pass of each. drainPendingFetches and
+   * drainPendingModuleRequests each loop internally, but calling them back
+   * to back one time each misses a real pattern: resolving a *module*
+   * request can run code that queues a *new fetch* (e.g. a feature-flag
+   * client's own initialization fetch, triggered by finishing an import of
+   * the module that constructs it) — and since the fetch pass already
+   * finished, that new fetch wouldn't be serviced until some *unrelated*
+   * future call happened to run drainPendingFetches again. The reverse
+   * (a fetch's .then() triggering a new dynamic import) has the same
+   * problem in the other direction. Peeking both queues' lengths directly
+   * (cheap — no dequeue) and looping until a full round finds neither
+   * queue has anything closes that gap; bounded generously since each
+   * round can itself take several fetches/imports to fully drain.
+   */
+  async function settleFetchesAndModules(
+    doFetch: (url: string) => Promise<{ status: number; body: string }>,
+    visited: Set<string>,
+    moduleErrors: { src?: string; message: string }[],
+    uncaughtErrors: { type: string; message: string }[],
+    consoleMessages: { level: string; message: string }[],
+  ): Promise<void> {
+    for (let round = 0; round < 50; round++) {
+      drainJobsAndTimers();
+      const peek = await evalRaw(
+        'JSON.stringify([__kk_fetch_queue.length > 0, __kk_module_request_queue.length > 0])'
+      );
+      let hasFetch = false;
+      let hasModule = false;
+      if (peek.success) {
+        try {
+          [hasFetch, hasModule] = JSON.parse(peek.result);
+        } catch {
+          break;
+        }
+      }
+      if (!hasFetch && !hasModule) {
+        trace('settle-quiescent', { round });
+        break;
+      }
+      trace('settle-round', { round, hasFetch, hasModule });
+      if (hasFetch) await drainPendingFetches(doFetch, uncaughtErrors, consoleMessages);
+      if (hasModule) await drainPendingModuleRequests(doFetch, visited, moduleErrors, uncaughtErrors, consoleMessages);
     }
   }
 
@@ -506,20 +856,107 @@ export async function createKenkage(
    * source text* — pre-fetching it here means QuickJS's (synchronous)
    * module loader already has it by the time that `import()` actually
    * executes, even though nothing "statically" imports it in the ESM
-   * sense. Only specifiers built from computed values or template
-   * literals (`import(\`./pages/${name}.js\`)`) can't be seen this way —
-   * a known, documented limitation (see crawlModuleGraph below).
+   * sense. Bundlers (Vite in particular) commonly emit these dynamic
+   * `import()` specifiers as backtick template literals rather than
+   * quoted strings even when there's no interpolation at all — e.g.
+   * `import(\`./Search-CxC9sRAs.js\`)` for a `React.lazy()` route chunk —
+   * so backtick-delimited specifiers are matched too. Only specifiers
+   * built from computed values or *actual* template interpolation
+   * (`import(\`./pages/${name}.js\`)`) can't be seen this way — a known,
+   * documented limitation (see crawlModuleGraph below) — so any captured
+   * specifier still containing `${` is discarded rather than resolved
+   * into garbage.
    */
   function extractImportSpecifiers(code: string): string[] {
     const specifiers = new Set<string>();
-    const fromRe = /\bfrom\s*['"]([^'"]+)['"]/g;
-    const bareImportRe = /\bimport\s*['"]([^'"]+)['"]/g;
-    const dynamicImportRe = /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+    const fromRe = /\bfrom\s*['"`]([^'"`]+)['"`]/g;
+    const bareImportRe = /\bimport\s*['"`]([^'"`]+)['"`]/g;
+    const dynamicImportRe = /\bimport\s*\(\s*['"`]([^'"`]+)['"`]\s*\)/g;
+    const consider = (spec: string) => {
+      if (!spec.includes('${')) specifiers.add(spec);
+    };
     let m: RegExpExecArray | null;
-    while ((m = fromRe.exec(code))) specifiers.add(m[1]);
-    while ((m = bareImportRe.exec(code))) specifiers.add(m[1]);
-    while ((m = dynamicImportRe.exec(code))) specifiers.add(m[1]);
+    while ((m = fromRe.exec(code))) consider(m[1]);
+    while ((m = bareImportRe.exec(code))) consider(m[1]);
+    while ((m = dynamicImportRe.exec(code))) consider(m[1]);
     return [...specifiers];
+  }
+
+  /**
+   * Rewrites `import(expr)` call sites into `__kk_dynamic_import(expr,
+   * moduleUrl)` so a specifier that's genuinely computed at runtime (or
+   * one only ever invoked after loadPage() has already returned) can still
+   * resolve — extractImportSpecifiers only ever catches what's visible as
+   * literal text *before* evaluation, which is fundamentally impossible for
+   * a name built at runtime. There's no way to intercept the `import()`
+   * keyword itself (it's syntax, not a rebindable function) — Babel's
+   * dynamic-import transform and SystemJS both solve this the same way, by
+   * rewriting the call site before the code ever runs as a real `import()`.
+   *
+   * __kk_dynamic_import (see the DOM prelude) queues a request the host
+   * services on demand via drainPendingModuleRequests: fetch the target,
+   * register it (crawling its own statically-visible dependencies too),
+   * then let a *real* import() run inside the sandbox now that the module
+   * sits in the same pre-fetch table crawlModuleGraph populates — so
+   * linking/evaluation is still QuickJS's own, not reimplemented here.
+   *
+   * A hand-rolled balanced-parenthesis scanner rather than a regex: the
+   * argument expression can itself contain parens (`import(getPath())`) or
+   * a template literal with `${...}` interpolation containing its own
+   * parens, and naively matching up to the first `)` would truncate those.
+   * Quoted/templated spans are skipped as opaque units (respecting `\`
+   * escapes) — correct for this purpose since only the *outer* matching
+   * paren of `import(` matters, not anything structurally inside a string.
+   *
+   * Cheap no-op fast path: skips entirely if `import(` doesn't appear at
+   * all (true for the overwhelming majority of chunks), so this doesn't
+   * add meaningful cost to registering the hundreds of modules a real
+   * SPA's graph can contain.
+   */
+  function rewriteDynamicImports(code: string, moduleUrl?: string): string {
+    if (!/\bimport\s*\(/.test(code)) return code;
+    // No specific module context (a plain eval() call, not a <script>/
+    // module being registered) — pass the literal `undefined` so
+    // __kk_dynamic_import falls back to the page's current location.
+    const marker = moduleUrl === undefined ? 'undefined' : JSON.stringify(moduleUrl);
+    const importRe = /\bimport\s*\(/g;
+    let out = '';
+    let lastEnd = 0;
+    let m: RegExpExecArray | null;
+    while ((m = importRe.exec(code))) {
+      // import.meta / import assertions ("import" followed by "." rather
+      // than "(") never match this regex to begin with, so no guard needed
+      // for those — only `import(` itself is matched.
+      const openParenIdx = m.index + m[0].length - 1;
+      let depth = 1;
+      let j = openParenIdx + 1;
+      let quote: string | null = null;
+      while (j < code.length && depth > 0) {
+        const c = code[j];
+        if (quote) {
+          if (c === '\\') { j += 2; continue; }
+          if (c === quote) quote = null;
+          j++;
+          continue;
+        }
+        if (c === '"' || c === "'" || c === '`') { quote = c; j++; continue; }
+        if (c === '(') depth++;
+        else if (c === ')') depth--;
+        j++;
+      }
+      const closeParenIdx = j - 1;
+      if (depth !== 0) {
+        // Unbalanced (shouldn't happen for valid JS) — leave the rest of
+        // the source untouched rather than risk mangling it.
+        break;
+      }
+      const arg = code.slice(openParenIdx + 1, closeParenIdx);
+      out += code.slice(lastEnd, m.index) + '__kk_dynamic_import(' + arg + ', ' + marker + ')';
+      lastEnd = closeParenIdx + 1;
+      importRe.lastIndex = lastEnd;
+    }
+    out += code.slice(lastEnd);
+    return out;
   }
 
   /** Writes two strings back-to-back starting at `baseOffset`, growing WASM
@@ -540,12 +977,14 @@ export async function createKenkage(
    * module table, so QuickJS's (synchronous) module loader can find it. */
   function registerModule(moduleUrl: string, code: string): void {
     if (!exports.kk_js_register_module) return;
+    const rewritten = rewriteDynamicImports(code, moduleUrl);
     const { aLen: urlLen, bOffset: codeOffset, bLen: codeLen } = writeTwoStringsAt(
       moduleUrl,
-      code,
+      rewritten,
       EVAL_FETCH_OFFSET,
     );
     exports.kk_js_register_module(EVAL_FETCH_OFFSET, urlLen, codeOffset, codeLen);
+    trace('module-register', { url: moduleUrl, codeLen: code.length, rewrittenImports: rewritten !== code });
   }
 
   /** Evaluates `code` as an ES module resolved as `moduleUrl` — the
@@ -558,7 +997,7 @@ export async function createKenkage(
       EVAL_FETCH_OFFSET,
     );
     const rc = exports.kk_js_eval_module!(EVAL_FETCH_OFFSET, urlLen, codeOffset, codeLen);
-    exports.kk_js_run_pending_jobs?.();
+    drainJobsAndTimers();
     const mem = new Uint8Array(exports.memory.buffer);
     if (rc === 0) {
       const ptr = exports.kk_js_get_result!();
@@ -591,6 +1030,19 @@ export async function createKenkage(
    * or ones this fetch pass couldn't reach) are left alone — evalModule()/
    * the loader will surface a clear ReferenceError (static) or a rejected
    * Promise (dynamic) for them rather than this throwing here.
+   *
+   * Fetches an entire BFS *level* concurrently via Promise.all rather than
+   * one specifier at a time — a real SPA's reachable graph routinely runs
+   * into the thousands of modules (confirmed by trace: this app's is
+   * ~1000), and awaiting each fetch sequentially turned a network-latency-
+   * bound operation a real browser completes in a couple of seconds (via
+   * HTTP/2 multiplexing or just parallel connections) into tens of
+   * seconds of pure wall-clock waiting before the page's own bootstrap
+   * script had even finished running — self-inflicted by this loop's
+   * structure, nothing to do with the target site. `visited` is marked
+   * *before* each fetch kicks off (synchronously, before any await), so
+   * concurrent fetches within a level can't double-queue the same
+   * specifier — safe because JS is single-threaded between awaits.
    */
   async function crawlModuleGraph(
     entryUrl: string,
@@ -600,27 +1052,48 @@ export async function createKenkage(
     errors: { src?: string; message: string }[],
   ): Promise<void> {
     visited.add(entryUrl);
-    const queue: { url: string; code: string }[] = [{ url: entryUrl, code: entryCode }];
-    while (queue.length > 0) {
-      const { url: fromUrl, code } = queue.shift()!;
-      for (const spec of extractImportSpecifiers(code)) {
-        let resolved: string;
-        try {
-          resolved = new URL(spec, fromUrl).toString();
-        } catch {
-          continue;
-        }
-        if (visited.has(resolved)) continue;
-        visited.add(resolved);
-        try {
-          const res = await doFetch(resolved);
-          registerModule(resolved, res.body);
-          queue.push({ url: resolved, code: res.body });
-        } catch (err) {
-          errors.push({ src: resolved, message: err instanceof Error ? err.message : String(err) });
+    trace('crawl-start', { entryUrl });
+    let currentLevel: { url: string; code: string }[] = [{ url: entryUrl, code: entryCode }];
+    let fetched = 0;
+    let failed = 0;
+    while (currentLevel.length > 0) {
+      const toFetch: string[] = [];
+      for (const { url: fromUrl, code } of currentLevel) {
+        const specifiers = extractImportSpecifiers(code);
+        if (specifiers.length) trace('crawl-specifiers', { fromUrl, specifiers });
+        for (const spec of specifiers) {
+          let resolved: string;
+          try {
+            resolved = new URL(spec, fromUrl).toString();
+          } catch {
+            trace('crawl-unresolvable-specifier', { fromUrl, spec });
+            continue;
+          }
+          if (visited.has(resolved)) continue;
+          visited.add(resolved);
+          toFetch.push(resolved);
         }
       }
+      if (toFetch.length === 0) break;
+      const results = await Promise.all(
+        toFetch.map(async (resolved): Promise<{ url: string; code: string } | null> => {
+          try {
+            const res = await doFetch(resolved);
+            registerModule(resolved, res.body);
+            fetched++;
+            return { url: resolved, code: res.body };
+          } catch (err) {
+            failed++;
+            const message = err instanceof Error ? err.message : String(err);
+            errors.push({ src: resolved, message });
+            trace('crawl-fetch-failed', { url: resolved, message });
+            return null;
+          }
+        }),
+      );
+      currentLevel = results.filter((r): r is { url: string; code: string } => r !== null);
     }
+    trace('crawl-done', { entryUrl, fetched, failed });
   }
 
   function readStringFromResult(getPtr: () => number, getLen: () => number, cacheKey: string): string {
@@ -746,60 +1219,37 @@ export async function createKenkage(
       return readUint32ArrayFromResult(count);
     },
 
-    async eval(code: string): Promise<{ success: boolean; result: string }> {
-      // 'full' engine build: run the code inside the in-WASM QuickJS
-      // engine — fully sandboxed, no host JS execution involved.
-      if (exports.kk_js_eval) {
-        ensureJsEngine();
-        const codeLen = writeStringAt(code, EVAL_FETCH_OFFSET);
-        const rc = exports.kk_js_eval(EVAL_FETCH_OFFSET, codeLen);
-        // Drain Promise microtasks and the setTimeout queue — real JS hosts
-        // do this after every turn of script execution, not on request.
-        exports.kk_js_run_pending_jobs?.();
-        // Read directly rather than through cachedRead: the result/error
-        // buffers are static C arrays at a fixed address, so ptr+len alone
-        // can't distinguish two different values that happen to share a
-        // length — it would serve stale content back.
-        const mem = new Uint8Array(exports.memory.buffer);
-        if (rc === 0) {
-          const ptr = exports.kk_js_get_result!();
-          const len = exports.kk_js_get_result_len!();
-          return { success: true, result: decoder.decode(mem.slice(ptr, ptr + len)) };
-        }
-        const ptr = exports.kk_js_get_error!();
-        const len = exports.kk_js_get_error_len!();
-        return { success: false, result: decoder.decode(mem.slice(ptr, ptr + len)) };
-      }
+    async eval(code: string): Promise<{
+      success: boolean;
+      result: string;
+      uncaughtErrors?: { type: string; message: string }[];
+      consoleMessages?: { level: string; message: string }[];
+    }> {
+      // Only the 'full' engine has fetch()/dynamic-import queues to drain
+      // at all. Rewriting here (with no specific moduleUrl — see
+      // rewriteDynamicImports) is what makes a plain `engine.eval("...import(...)...")`
+      // call able to resolve on demand too, not just code that arrived via
+      // loadPage()'s own per-script loop.
+      if (!exports.kk_js_eval) return await evalRaw(code);
+      const result = await evalRaw(rewriteDynamicImports(code));
+      const uncaughtErrors: { type: string; message: string }[] = [];
+      const consoleMessages: { level: string; message: string }[] = [];
+      await settleFetchesAndModules(activeDoFetch, activeModuleVisited, [], uncaughtErrors, consoleMessages);
+      return { ...result, uncaughtErrors, consoleMessages };
+    },
 
-      // 'core' engine build: no in-WASM JS engine — delegate to the host.
-      // 1. Write code to WASM memory at EVAL_FETCH_OFFSET
-      const codeLen = writeStringAt(code, EVAL_FETCH_OFFSET);
-
-      // 2. Signal WASM that a JS eval request is pending
-      exports.kk_eval_js_request(EVAL_FETCH_OFFSET, codeLen);
-
-      // 3. Execute the code in the host JS engine
-      // Use eval() to get the completion value (last expression result),
-      // falling back to new Function() for multi-statement code blocks.
-      let success = false;
-      let resultStr = '';
-
-      try {
-        const value = eval(code);
-        resultStr = value === undefined ? 'undefined' : String(value);
-        success = true;
-      } catch (err: unknown) {
-        success = false;
-        resultStr = err instanceof Error ? err.message : String(err);
-      }
-
-      // 4. Write result back to WASM memory
-      const resultLen = writeStringAt(resultStr, EVAL_FETCH_OFFSET);
-
-      // 5. Deliver result to WASM
-      exports.kk_eval_js_complete(success ? 1 : 0, EVAL_FETCH_OFFSET, resultLen);
-
-      return { success, result: resultStr };
+    async settle(): Promise<{
+      uncaughtErrors: { type: string; message: string }[];
+      consoleMessages: { level: string; message: string }[];
+    }> {
+      const uncaughtErrors: { type: string; message: string }[] = [];
+      const consoleMessages: { level: string; message: string }[] = [];
+      if (!exports.kk_js_eval) return { uncaughtErrors, consoleMessages };
+      drainJobsAndTimers();
+      uncaughtErrors.push(...(await drainUncaughtErrors()));
+      consoleMessages.push(...(await drainConsoleMessages()));
+      await settleFetchesAndModules(activeDoFetch, activeModuleVisited, [], uncaughtErrors, consoleMessages);
+      return { uncaughtErrors, consoleMessages };
     },
 
     async fetch(
@@ -858,6 +1308,11 @@ export async function createKenkage(
         throw new Error("loadPage() requires the 'full' engine (real QuickJS) — use createKenkage({ engine: 'full' }).");
       }
       const doFetch = options?.fetchFn ?? ((u: string) => api.fetch(u));
+      activeDoFetch = doFetch;
+      tracing = !!options?.trace;
+      traceEvents = [];
+      traceStart = Date.now();
+      trace('loadPage-start', { url });
 
       // A page load gets a genuinely fresh JS realm — no leftover globals,
       // timers, listeners, or (critically) QuickJS's own internal
@@ -872,6 +1327,7 @@ export async function createKenkage(
       exports.kk_js_reset?.();
 
       const { status, body } = await doFetch(url);
+      trace('main-fetch', { url, status, bodyLen: body.length });
       api.parse(body);
 
       // Seed location/history from the real page URL — kk_js_reset() just
@@ -881,7 +1337,7 @@ export async function createKenkage(
       // window.location (e.g. `fetch(location.origin + '/api/...')`), so
       // leaving this at the default would silently point those calls at
       // the wrong place even once they do execute.
-      await api.eval(`(function () {
+      await evalRaw(`(function () {
         const u = new URL(${JSON.stringify(url)});
         Object.assign(globalThis.location, {
           href: u.href, protocol: u.protocol, host: u.host, hostname: u.hostname,
@@ -890,15 +1346,23 @@ export async function createKenkage(
       })();`);
 
       const scriptIds = api.querySelector('script');
+      trace('scripts-found', { count: scriptIds.length });
       let scriptsExecuted = 0;
       const scriptsSkipped: { src?: string; reason: string }[] = [];
       const scriptErrors: { src?: string; message: string }[] = [];
       const uncaughtErrors: { type: string; message: string }[] = [];
+      const consoleMessages: { level: string; message: string }[] = [];
       // Import-graph dedup set shared across every module script on the
       // page so common dependencies are only fetched once. See
       // crawlModuleGraph above. (The module source table itself was
-      // already cleared by kk_js_reset() above.)
-      const moduleVisited = new Set<string>();
+      // already cleared by kk_js_reset() above.) Reassigning (not just
+      // clearing) activeModuleVisited gives this page load a genuinely
+      // fresh set — matches kk_js_reset() giving it a fresh module table —
+      // while still leaving it as the SAME object eval()/settle() will
+      // keep reusing for anything dynamically imported after this call
+      // returns.
+      activeModuleVisited = new Set<string>();
+      const moduleVisited = activeModuleVisited;
 
       for (const id of scriptIds) {
         const type = api.nodeAttr(id, 'type').trim().toLowerCase();
@@ -944,23 +1408,39 @@ export async function createKenkage(
         // Real bundlers commonly read document.currentScript to resolve
         // their own chunk's URL — set it for the duration of this script,
         // matching what a real browser does during synchronous execution.
-        await api.eval(`document.currentScript = __kk_wrap_node(${id});`);
+        trace('script-start', { id, isModule, src, moduleUrl, codeLen: code.length });
+        await evalRaw(`document.currentScript = __kk_wrap_node(${id});`);
         let result: { success: boolean; result: string };
         if (isModule) {
+          // Crawl the ORIGINAL code first — extractImportSpecifiers looks
+          // for literal `import(...)`/`from "..."` text, which the rewrite
+          // below removes for every dynamic import() call site (including
+          // ones that were statically discoverable and just got crawled).
           await crawlModuleGraph(moduleUrl!, code, doFetch, moduleVisited, scriptErrors);
-          result = await evalModule(moduleUrl!, code);
+          result = await evalModule(moduleUrl!, rewriteDynamicImports(code, moduleUrl!));
         } else {
-          result = await api.eval(code);
+          // Classic scripts were never crawled at all (crawlModuleGraph is
+          // ES-module-specific static analysis) — dynamic import() is valid
+          // here too, and now resolves purely on demand via
+          // drainPendingModuleRequests instead of needing any pre-crawl.
+          result = await evalRaw(rewriteDynamicImports(code, url));
         }
-        await api.eval('document.currentScript = null;');
+        await evalRaw('document.currentScript = null;');
+        trace('script-done', { id, success: result.success, resultOrError: result.success ? undefined : result.result });
         if (!result.success) {
           scriptErrors.push({ src, message: result.result });
         }
         scriptsExecuted++;
         uncaughtErrors.push(...(await drainUncaughtErrors()));
+        consoleMessages.push(...(await drainConsoleMessages()));
         // A script's own top-level fetch() calls (or ones queued by its
-        // synchronous execution) get their real network round-trip here.
-        await drainPendingFetches(doFetch, uncaughtErrors);
+        // synchronous execution) get their real network round-trip here,
+        // and any dynamic import() it made that couldn't be pre-crawled (a
+        // computed specifier, or one crawlModuleGraph simply hasn't reached
+        // yet) settles the same way — looped together to a joint fixed
+        // point since either can trigger the other (see
+        // settleFetchesAndModules).
+        await settleFetchesAndModules(doFetch, moduleVisited, scriptErrors, uncaughtErrors, consoleMessages);
       }
 
       // Real pages hang a lot of setup off these — run any handlers scripts
@@ -969,11 +1449,16 @@ export async function createKenkage(
       // spec, but `load` listeners are overwhelmingly registered on `window`
       // in the wild (analytics/tag-manager snippets in particular), so both
       // targets get it rather than assuming which one a given script used.
-      await api.eval(
+      trace('dispatch-domcontentloaded-load');
+      await evalRaw(
         "document.dispatchEvent('DOMContentLoaded'); document.dispatchEvent('load'); window.dispatchEvent('load');"
       );
       uncaughtErrors.push(...(await drainUncaughtErrors()));
-      await drainPendingFetches(doFetch, uncaughtErrors);
+      consoleMessages.push(...(await drainConsoleMessages()));
+      await settleFetchesAndModules(doFetch, moduleVisited, scriptErrors, uncaughtErrors, consoleMessages);
+
+      const finalNodeCount = api.getNodeCount();
+      trace('loadPage-done', { scriptsExecuted, nodeCount: finalNodeCount, textLen: api.getText().length });
 
       return {
         status,
@@ -984,6 +1469,8 @@ export async function createKenkage(
         scriptsSkipped,
         scriptErrors,
         uncaughtErrors,
+        consoleMessages,
+        trace: traceEvents,
       };
     },
   };
