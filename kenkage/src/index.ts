@@ -71,8 +71,9 @@ export interface KenkageWasm {
    * pending work in the first place).
    */
   settle(): Promise<{
-    uncaughtErrors: { type: string; message: string }[];
+    uncaughtErrors: { type: string; message: string; stack?: string }[];
     consoleMessages: { level: string; message: string }[];
+    scriptErrors?: { id: number | string; src?: string; message: string; stack?: string }[];
   }>;
   /** Fetch a URL using the host's fetch API. Returns the response. */
   fetch(url: string, options?: { method?: string; headers?: Record<string, string>; body?: string }): Promise<{ status: number; body: string }>;
@@ -1343,6 +1344,84 @@ export async function createKenkage(
           href: u.href, protocol: u.protocol, host: u.host, hostname: u.hostname,
           port: u.port, pathname: u.pathname, search: u.search, hash: u.hash, origin: u.origin,
         });
+
+        // 1. Polyfill TextEncoder and TextDecoder
+        if (!globalThis.TextEncoder) {
+          globalThis.TextEncoder = class TextEncoder {
+            encode(str) {
+              const arr = [];
+              for (let i = 0; i < str.length; i++) {
+                let charcode = str.charCodeAt(i);
+                if (charcode < 0x80) arr.push(charcode);
+                else if (charcode < 0x800) arr.push(0xc0 | (charcode >> 6), 0x80 | (charcode & 0x3f));
+                else if (charcode < 0xd800 || charcode >= 0xe000) arr.push(0xe0 | (charcode >> 12), 0x80 | ((charcode >> 6) & 0x3f), 0x80 | (charcode & 0x3f));
+                else {
+                  i++; charcode = 0x10000 + (((charcode & 0x3ff)<<10) | (str.charCodeAt(i) & 0x3ff));
+                  arr.push(0xf0 | (charcode >> 18), 0x80 | ((charcode >> 12) & 0x3f), 0x80 | ((charcode >> 6) & 0x3f), 0x80 | (charcode & 0x3f));
+                }
+              }
+              return new Uint8Array(arr);
+            }
+          };
+        }
+        if (!globalThis.TextDecoder) {
+          globalThis.TextDecoder = class TextDecoder {
+            decode(bytes) {
+              if (!bytes) return '';
+              let result = ''; let i = 0;
+              while (i < bytes.length) {
+                let c = bytes[i++];
+                if (c > 127) {
+                  if (c > 191 && c < 224) c = (c & 31) << 6 | bytes[i++] & 63;
+                  else if (c > 223 && c < 240) c = (c & 15) << 12 | (bytes[i++] & 63) << 6 | bytes[i++] & 63;
+                  else if (c > 239 && c < 248) c = (c & 7) << 18 | (bytes[i++] & 63) << 12 | (bytes[i++] & 63) << 6 | bytes[i++] & 63;
+                }
+                if (c <= 0xffff) result += String.fromCharCode(c);
+                else {
+                  c -= 0x10000;
+                  result += String.fromCharCode((c >> 10 | 0xd800), (c & 0x3FF | 0xdc00));
+                }
+              }
+              return result;
+            }
+          };
+        }
+        
+        // 2. Mock Fetch response stream
+        globalThis.__kk_make_response = function (status, bodyText) {
+          return {
+            ok: status >= 200 && status < 300,
+            status,
+            statusText: '',
+            headers: { get: () => null, forEach: () => {} },
+            text: () => Promise.resolve(bodyText),
+            json: () => Promise.resolve(JSON.parse(bodyText)),
+            body: {
+              getReader: function() {
+                let done = false;
+                return {
+                  read: function() {
+                    if (done) return Promise.resolve({ done: true });
+                    done = true;
+                    return Promise.resolve({ done: false, value: new globalThis.TextEncoder().encode(bodyText || '') });
+                  }
+                };
+              }
+            }
+          };
+        };
+        
+        // 3. Polyfill document.readyState and baseURI
+        Object.defineProperty(document, 'readyState', { value: 'loading', writable: true });
+        if (!('baseURI' in document)) {
+          Object.defineProperty(document, 'baseURI', { get() { return globalThis.location.href; } });
+        }
+        
+        // 4. Next.js expects document.currentScript to be a <script> node. 
+        // We will mock __kk_wrap_node so that it returns a plain object if requested.
+        // Actually, we can intercept the eval execution. Next.js explicitly checks Object.prototype.toString.call!
+        // We can override the Array/Object iteration if needed.
+        // To bypass the toString check completely, we can override document.currentScript directly before scripts!
       })();`);
 
       const scriptIds = api.querySelector('script');
@@ -1409,7 +1488,40 @@ export async function createKenkage(
         // their own chunk's URL — set it for the duration of this script,
         // matching what a real browser does during synchronous execution.
         trace('script-start', { id, isModule, src, moduleUrl, codeLen: code.length });
-        await evalRaw(`document.currentScript = __kk_wrap_node(${id});`);
+        await evalRaw(`
+          if (globalThis.__kk_URL) globalThis.URL = globalThis.__kk_URL;
+          document.currentScript = __kk_wrap_node(${id});
+          if (globalThis.HTMLScriptElement) {
+            // Next.js checks both the DOM string tag and instanceof
+            // HTMLScriptElement. Keep the native node methods in the
+            // prototype chain while giving this one parsed script the
+            // browser's concrete element identity.
+            try { Object.setPrototypeOf(document.currentScript, globalThis.HTMLScriptElement.prototype); } catch (e) {}
+          }
+          (function() {
+            // QuickJS may continue framework work queued by an inline
+            // bootstrap script after this synchronous turn has returned.
+            // Give inline scripts a stable same-origin /_next/ URL so
+            // Next.js' asset-prefix resolver does not receive the empty
+            // browser src value while that deferred work is running.
+            let scriptSrc = ${JSON.stringify(
+              src
+                ? new URL(src, url).toString()
+                : new URL('/_next/static/chunks/inline.js', url).toString(),
+            )};
+            Object.assign(document.currentScript, {
+              tagName: 'SCRIPT',
+              nodeName: 'SCRIPT',
+              src: scriptSrc,
+              get [Symbol.toStringTag]() { return 'HTMLScriptElement'; }
+            });
+            // Some QuickJS class wrappers do not invoke an inherited
+            // accessor when an expando is assigned. Define the value
+            // explicitly so code that snapshots currentScript during a
+            // chunk's top-level evaluation sees the absolute URL.
+            try { Object.defineProperty(document.currentScript, 'src', { value: scriptSrc, writable: true, configurable: true }); } catch (e) {}
+          })();
+        `);
         let result: { success: boolean; result: string };
         if (isModule) {
           // Crawl the ORIGINAL code first — extractImportSpecifiers looks
@@ -1451,7 +1563,7 @@ export async function createKenkage(
       // targets get it rather than assuming which one a given script used.
       trace('dispatch-domcontentloaded-load');
       await evalRaw(
-        "document.dispatchEvent('DOMContentLoaded'); document.dispatchEvent('load'); window.dispatchEvent('load');"
+        "document.readyState = 'complete'; document.dispatchEvent(new Event('DOMContentLoaded')); document.dispatchEvent(new Event('load')); window.dispatchEvent(new Event('load'));"
       );
       uncaughtErrors.push(...(await drainUncaughtErrors()));
       consoleMessages.push(...(await drainConsoleMessages()));
@@ -1477,5 +1589,3 @@ export async function createKenkage(
 
   return api;
 }
-
-

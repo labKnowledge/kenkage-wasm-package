@@ -165,6 +165,31 @@ describe('loadPage — deferred (post-load) fetch patterns actually run', () => 
   });
 });
 
+describe('loadPage — streaming browser APIs remain open until producers finish', () => {
+  it('waits for a later ReadableStream enqueue instead of returning done immediately', async () => {
+    const html = `<html><body>
+      <script>
+        (async () => {
+          const stream = new ReadableStream({
+            start(controller) {
+              setTimeout(() => { controller.enqueue('late'); controller.close(); }, 0);
+            }
+          });
+          const reader = stream.getReader();
+          const first = await reader.read();
+          document.body.setAttribute('data-stream', first.value);
+        })();
+      </script>
+    </body></html>`;
+    const { fetchFn } = makeFetchMock({ 'https://example.com/': html });
+
+    const result = await engine.loadPage('https://example.com/', { fetchFn });
+
+    expect(result.uncaughtErrors).toEqual([]);
+    expect(result.html).toContain('data-stream="late"');
+  });
+});
+
 describe('eval — previously-missing globals now exist and behave pragmatically', () => {
   it('no longer reports any of the previously-missing globals as undefined', async () => {
     const names = [
