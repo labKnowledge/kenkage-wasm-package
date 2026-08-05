@@ -2,10 +2,48 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { createKenkage } from 'kenkage';
+import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 // Response fields that carry page content (text/html/markdown) are capped so
 // a single tool call can't flood the calling agent's context with a huge page.
 const MAX_FIELD_LENGTH = 20000;
+
+// Read straight from package.json rather than any in-engine version string:
+// the WASM engine exposes its own internal version (`engine.version`, via
+// kk_version()), but that's a separate number baked into the Zig source at
+// build time and drifts out of sync with the npm package version (observed
+// firsthand: engine.version reads "0.2.0" while the installed kenkage
+// package.json says "0.3.0") — package.json is what an agent actually needs
+// to know when deciding whether a fix it's expecting has shipped.
+const require = createRequire(import.meta.url);
+
+// kenkage's own package.json declares an `exports` map that doesn't expose
+// `./package.json` as a subpath, so `require.resolve('kenkage/package.json')`
+// is refused outright by Node's resolver - has to go the long way: resolve
+// the package's real entry file, then walk up directories until finding the
+// package.json that actually names it (handles it living directly under
+// node_modules/kenkage or nested deeper under npm's own dedup layout).
+function findPackageJson(resolvedEntryFile, expectedName) {
+  let dir = dirname(resolvedEntryFile);
+  for (let i = 0; i < 10; i++) {
+    const candidate = join(dir, 'package.json');
+    try {
+      const pkg = JSON.parse(readFileSync(candidate, 'utf8'));
+      if (pkg.name === expectedName) return pkg;
+    } catch {
+      // no package.json here, or it belongs to something else - keep going up
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  throw new Error(`could not find package.json for "${expectedName}" above ${resolvedEntryFile}`);
+}
+
+const mcpPackageJson = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+const kenkagePackageJson = findPackageJson(require.resolve('kenkage'), 'kenkage');
 
 function truncate(value) {
   if (typeof value !== 'string' || value.length <= MAX_FIELD_LENGTH) return value;
@@ -23,7 +61,7 @@ function errorResult(err) {
 
 const server = new McpServer({
   name: 'kenkage-mcp',
-  version: '0.1.0',
+  version: mcpPackageJson.version,
 });
 
 server.registerTool(
@@ -150,6 +188,22 @@ server.registerTool(
     } finally {
       engine?.destroy();
     }
+  }
+);
+
+server.registerTool(
+  'get_versions',
+  {
+    title: 'Get kenkage-mcp and kenkage versions',
+    description:
+      "Reports the installed version of this MCP server (kenkage-mcp) and of the kenkage engine package it depends on, straight from their package.json files. Use this to check what's actually running — e.g. to confirm a specific fix has shipped — without guessing from behavior. Deliberately does not use the WASM engine's own internal version string (exposed as `version` on a created engine instance): that number is baked into the Zig source separately from the npm package version and can drift out of sync with it (observed: engine-internal version read '0.2.0' while the installed kenkage package.json said '0.3.0'), so it's an unreliable answer to \"what version of kenkage is this.\"",
+    inputSchema: {},
+  },
+  async () => {
+    return textResult({
+      kenkageMcp: { name: mcpPackageJson.name, version: mcpPackageJson.version },
+      kenkage: { name: kenkagePackageJson.name, version: kenkagePackageJson.version },
+    });
   }
 );
 

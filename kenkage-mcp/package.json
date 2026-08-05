@@ -1,6 +1,6 @@
 {
   "name": "kenkage-mcp",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "MCP server exposing kenkage's on-device, isolation-by-construction DOM+JS engine as agent tools: safely load/parse a page, query the DOM, and run untrusted JavaScript in a real WASM sandbox — no headless browser, no server round-trip.",
   "type": "module",
   "bin": {
